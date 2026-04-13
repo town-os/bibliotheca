@@ -1,0 +1,226 @@
+syntax = "proto3";
+
+package bibliotheca.v1;
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/empty.proto";
+
+// =====================================================================
+// bibliotheca.v1 — control plane for the Bibliotheca object storage daemon.
+//
+// All RPCs here are intended to be served on a local Unix domain socket.
+// There is no network-exposed authentication on this surface; access is
+// gated by filesystem permissions on the socket itself. End-user data
+// access is handled by the data-plane interface crates (HTTP, S3, etc.).
+// =====================================================================
+
+// ---------- Identity ----------
+
+message User {
+  string id = 1;          // ULID/UUID
+  string name = 2;        // unique login name
+  string display_name = 3;
+  repeated string group_ids = 4;
+  google.protobuf.Timestamp created_at = 5;
+  bool disabled = 6;
+}
+
+message Group {
+  string id = 1;
+  string name = 2;
+  string description = 3;
+  google.protobuf.Timestamp created_at = 4;
+}
+
+// ---------- ACLs ----------
+
+enum Permission {
+  PERMISSION_UNSPECIFIED = 0;
+  PERMISSION_READ = 1;
+  PERMISSION_WRITE = 2;
+  PERMISSION_LIST = 3;
+  PERMISSION_DELETE = 4;
+  PERMISSION_ADMIN = 5; // implies all others + ACL management
+}
+
+enum PrincipalKind {
+  PRINCIPAL_KIND_UNSPECIFIED = 0;
+  PRINCIPAL_KIND_USER = 1;
+  PRINCIPAL_KIND_GROUP = 2;
+  PRINCIPAL_KIND_PUBLIC = 3; // anonymous via opt-in HTTP
+}
+
+message AclEntry {
+  PrincipalKind principal_kind = 1;
+  string principal_id = 2; // empty for PUBLIC
+  repeated Permission permissions = 3;
+}
+
+message Acl {
+  repeated AclEntry entries = 1;
+}
+
+// ---------- Subvolumes ----------
+
+message Subvolume {
+  string id = 1;
+  string name = 2;            // path-safe
+  string owner_user_id = 3;
+  string mount_path = 4;      // host filesystem mount of the subvolume
+  uint64 quota_bytes = 5;     // 0 = unlimited
+  Acl acl = 6;
+  google.protobuf.Timestamp created_at = 7;
+}
+
+message Snapshot {
+  string id = 1;
+  string subvolume_id = 2;
+  string name = 3;
+  string mount_path = 4;
+  bool readonly = 5;
+  google.protobuf.Timestamp created_at = 6;
+}
+
+// ---------- Interfaces (data-plane protocols) ----------
+
+enum InterfaceKind {
+  INTERFACE_KIND_UNSPECIFIED = 0;
+  INTERFACE_KIND_HTTP = 1;       // authenticated HTTP — opt-in by default
+  INTERFACE_KIND_S3 = 2;
+  INTERFACE_KIND_SOLID = 3;
+  INTERFACE_KIND_DROPBOX = 4;
+  INTERFACE_KIND_NEXTCLOUD = 5;
+  INTERFACE_KIND_GCS = 6;
+  INTERFACE_KIND_ICLOUD = 7;
+  INTERFACE_KIND_IPFS = 8;
+}
+
+message InterfaceConfig {
+  InterfaceKind kind = 1;
+  bool enabled = 2;     // false by default for HTTP
+  string listen = 3;    // e.g. 127.0.0.1:8443, [::1]:9000, /run/bibliotheca/s3.sock
+  bool tls = 4;
+  string tls_cert_path = 5;
+  string tls_key_path = 6;
+  // free-form per-interface config; interface crates own validation.
+  map<string, string> options = 7;
+}
+
+// =====================================================================
+// Service surface
+// =====================================================================
+
+service Identity {
+  rpc CreateUser(CreateUserRequest) returns (User);
+  rpc GetUser(GetUserRequest) returns (User);
+  rpc ListUsers(ListUsersRequest) returns (ListUsersResponse);
+  rpc DeleteUser(DeleteUserRequest) returns (google.protobuf.Empty);
+  rpc SetUserPassword(SetUserPasswordRequest) returns (google.protobuf.Empty);
+
+  rpc CreateGroup(CreateGroupRequest) returns (Group);
+  rpc GetGroup(GetGroupRequest) returns (Group);
+  rpc ListGroups(ListGroupsRequest) returns (ListGroupsResponse);
+  rpc DeleteGroup(DeleteGroupRequest) returns (google.protobuf.Empty);
+  rpc AddUserToGroup(AddUserToGroupRequest) returns (google.protobuf.Empty);
+  rpc RemoveUserFromGroup(RemoveUserFromGroupRequest) returns (google.protobuf.Empty);
+}
+
+message CreateUserRequest {
+  string name = 1;
+  string display_name = 2;
+  string password = 3; // hashed server-side
+}
+message GetUserRequest { string id_or_name = 1; }
+message ListUsersRequest { uint32 limit = 1; uint32 offset = 2; }
+message ListUsersResponse { repeated User users = 1; }
+message DeleteUserRequest { string id = 1; }
+message SetUserPasswordRequest { string id = 1; string password = 2; }
+
+message CreateGroupRequest { string name = 1; string description = 2; }
+message GetGroupRequest { string id_or_name = 1; }
+message ListGroupsRequest { uint32 limit = 1; uint32 offset = 2; }
+message ListGroupsResponse { repeated Group groups = 1; }
+message DeleteGroupRequest { string id = 1; }
+message AddUserToGroupRequest { string user_id = 1; string group_id = 2; }
+message RemoveUserFromGroupRequest { string user_id = 1; string group_id = 2; }
+
+service Storage {
+  rpc CreateSubvolume(CreateSubvolumeRequest) returns (Subvolume);
+  rpc GetSubvolume(GetSubvolumeRequest) returns (Subvolume);
+  rpc ListSubvolumes(ListSubvolumesRequest) returns (ListSubvolumesResponse);
+  rpc DeleteSubvolume(DeleteSubvolumeRequest) returns (google.protobuf.Empty);
+  rpc SetQuota(SetQuotaRequest) returns (Subvolume);
+
+  rpc SetAcl(SetAclRequest) returns (Subvolume);
+  rpc GetAcl(GetAclRequest) returns (Acl);
+
+  rpc CreateSnapshot(CreateSnapshotRequest) returns (Snapshot);
+  rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
+  rpc DeleteSnapshot(DeleteSnapshotRequest) returns (google.protobuf.Empty);
+}
+
+message CreateSubvolumeRequest {
+  string name = 1;
+  string owner_user_id = 2;
+  uint64 quota_bytes = 3;
+  Acl acl = 4;
+}
+message GetSubvolumeRequest { string id_or_name = 1; }
+message ListSubvolumesRequest {
+  string owner_user_id = 1; // optional filter
+  uint32 limit = 2;
+  uint32 offset = 3;
+}
+message ListSubvolumesResponse { repeated Subvolume subvolumes = 1; }
+message DeleteSubvolumeRequest { string id = 1; bool force = 2; }
+message SetQuotaRequest { string id = 1; uint64 quota_bytes = 2; }
+message SetAclRequest { string subvolume_id = 1; Acl acl = 2; }
+message GetAclRequest { string subvolume_id = 1; }
+message CreateSnapshotRequest { string subvolume_id = 1; string name = 2; bool readonly = 3; }
+message ListSnapshotsRequest { string subvolume_id = 1; }
+message ListSnapshotsResponse { repeated Snapshot snapshots = 1; }
+message DeleteSnapshotRequest { string id = 1; }
+
+service Interfaces {
+  rpc Get(GetInterfaceRequest) returns (InterfaceConfig);
+  rpc List(google.protobuf.Empty) returns (ListInterfacesResponse);
+  rpc Configure(InterfaceConfig) returns (InterfaceConfig);
+  rpc Enable(EnableInterfaceRequest) returns (InterfaceConfig);
+  rpc Disable(DisableInterfaceRequest) returns (InterfaceConfig);
+}
+
+message GetInterfaceRequest { InterfaceKind kind = 1; }
+message ListInterfacesResponse { repeated InterfaceConfig interfaces = 1; }
+message EnableInterfaceRequest { InterfaceKind kind = 1; }
+message DisableInterfaceRequest { InterfaceKind kind = 1; }
+
+// IPFS ingest is exposed as a control-plane RPC because it crosses
+// subvolume boundaries (pinning content into a target subvolume).
+service Ipfs {
+  rpc Pin(PinRequest) returns (PinResponse);
+  rpc Unpin(UnpinRequest) returns (google.protobuf.Empty);
+  rpc Import(ImportRequest) returns (ImportResponse);
+  rpc Export(ExportRequest) returns (ExportResponse);
+  rpc ListPins(ListPinsRequest) returns (ListPinsResponse);
+}
+
+message PinRequest {
+  string cid = 1;
+  string subvolume_id = 2; // destination subvolume
+  bool recursive = 3;
+}
+message PinResponse { string cid = 1; uint64 size_bytes = 2; }
+message UnpinRequest { string cid = 1; }
+message ImportRequest {
+  string subvolume_id = 1;
+  string source_path = 2; // path inside the subvolume
+}
+message ImportResponse { string cid = 1; }
+message ExportRequest {
+  string cid = 1;
+  string subvolume_id = 2;
+  string dest_path = 3;
+}
+message ExportResponse { uint64 bytes_written = 1; }
+message ListPinsRequest { string subvolume_id = 1; }
+message ListPinsResponse { repeated PinResponse pins = 1; }

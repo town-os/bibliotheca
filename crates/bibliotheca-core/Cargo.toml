@@ -1,0 +1,31 @@
+[package]
+name = "bibliotheca-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+# Exposes `bibliotheca_core::testing` with a filesystem-backed mock
+# `SubvolumeBackend` used across the workspace's integration tests.
+test-support = []
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["full"] }
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+time.workspace = true
+argon2.workspace = true
+rand.workspace = true
+rusqlite.workspace = true
+parking_lot.workspace = true

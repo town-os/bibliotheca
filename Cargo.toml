@@ -1,0 +1,78 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bibliotheca-proto",
+    "crates/bibliotheca-core",
+    "crates/bibliotheca-btrfs",
+    "crates/bibliotheca-ipfs",
+    "crates/bibliotheca-http",
+    "crates/bibliotheca-s3",
+    "crates/bibliotheca-solid",
+    "crates/bibliotheca-dropbox",
+    "crates/bibliotheca-nextcloud",
+    "crates/bibliotheca-gcs",
+    "crates/bibliotheca-icloud",
+    "crates/bibliothecad",
+    "crates/bibliothecactl",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.75"
+license = "AGPL-3.0-or-later"
+repository = "https://gitea.com/town-os/bibliotheca"
+
+[workspace.dependencies]
+bibliotheca-proto = { path = "crates/bibliotheca-proto" }
+bibliotheca-core = { path = "crates/bibliotheca-core" }
+bibliotheca-btrfs = { path = "crates/bibliotheca-btrfs" }
+bibliotheca-ipfs = { path = "crates/bibliotheca-ipfs" }
+bibliotheca-http = { path = "crates/bibliotheca-http" }
+bibliotheca-s3 = { path = "crates/bibliotheca-s3" }
+bibliotheca-solid = { path = "crates/bibliotheca-solid" }
+bibliotheca-dropbox = { path = "crates/bibliotheca-dropbox" }
+bibliotheca-nextcloud = { path = "crates/bibliotheca-nextcloud" }
+bibliotheca-gcs = { path = "crates/bibliotheca-gcs" }
+bibliotheca-icloud = { path = "crates/bibliotheca-icloud" }
+
+anyhow = "1"
+thiserror = "1"
+async-trait = "0.1"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tokio-util = { version = "0.7", features = ["io"] }
+futures = "0.3"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+time = { version = "0.3", features = ["serde", "formatting", "parsing"] }
+clap = { version = "4", features = ["derive", "env"] }
+tonic = "0.12"
+tonic-build = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio", "server"] }
+http = "1"
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace", "auth", "cors", "fs"] }
+axum = { version = "0.7", features = ["macros"] }
+argon2 = "0.5"
+rand = "0.8"
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"
+rusqlite = { version = "0.32", features = ["bundled"] }
+parking_lot = "0.12"
+url = "2"
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
