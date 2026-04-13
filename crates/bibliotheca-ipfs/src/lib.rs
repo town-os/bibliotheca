@@ -61,12 +61,7 @@ impl IpfsService {
     }
 
     /// Export `cid` from IPFS into `subvolume` at `dest_path`.
-    pub async fn export(
-        &self,
-        subvolume: SubvolumeId,
-        cid: &str,
-        dest_path: &Path,
-    ) -> Result<u64> {
+    pub async fn export(&self, subvolume: SubvolumeId, cid: &str, dest_path: &Path) -> Result<u64> {
         let sv = self.svc.store().get_subvolume(subvolume)?;
         let abs = absolutize(&sv.mount_path, dest_path)?;
         if let Some(parent) = abs.parent() {

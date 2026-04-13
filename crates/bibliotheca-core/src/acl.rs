@@ -60,11 +60,7 @@ impl Acl {
     }
 
     pub fn grant(&mut self, principal: Principal, permission: Permission) {
-        if let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|e| e.principal == principal)
-        {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.principal == principal) {
             entry.permissions.insert(permission);
             return;
         }
@@ -77,11 +73,7 @@ impl Acl {
     }
 
     pub fn revoke(&mut self, principal: &Principal, permission: Permission) {
-        if let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|e| &e.principal == principal)
-        {
+        if let Some(entry) = self.entries.iter_mut().find(|e| &e.principal == principal) {
             entry.permissions.remove(&permission);
         }
     }
@@ -104,11 +96,7 @@ impl Acl {
             if !matches {
                 continue;
             }
-            if entry
-                .permissions
-                .iter()
-                .any(|p| wanted.implied_by(*p))
-            {
+            if entry.permissions.iter().any(|p| wanted.implied_by(*p)) {
                 return true;
             }
         }

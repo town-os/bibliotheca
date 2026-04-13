@@ -162,10 +162,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let b = MemoryBackend::new(tmp.path().join("sv"));
         b.fail_next_quota();
-        let err = b
-            .set_quota(tmp.path(), 100)
-            .await
-            .expect_err("should fail");
+        let err = b.set_quota(tmp.path(), 100).await.expect_err("should fail");
         assert!(matches!(err, Error::Backend(_)));
         // second call recovers
         b.set_quota(tmp.path(), 100).await.unwrap();

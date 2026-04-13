@@ -8,29 +8,45 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use clap::Parser;
 use bibliotheca_btrfs::BtrfsBackend;
 use bibliotheca_core::backend::SubvolumeBackend;
 use bibliotheca_core::service::BibliothecaService;
 use bibliotheca_core::store::Store;
+use clap::Parser;
 use tracing::info;
 use tracing_subscriber::{prelude::*, EnvFilter};
 
 use bibliothecad::{control, interfaces};
 
 #[derive(Debug, Parser)]
-#[command(name = "bibliothecad", version, about = "Bibliotheca object storage daemon")]
+#[command(
+    name = "bibliothecad",
+    version,
+    about = "Bibliotheca object storage daemon"
+)]
 struct Args {
     /// Unix socket path for the gRPC control plane.
-    #[arg(long, env = "BIBLIOTHECA_SOCKET", default_value = "/run/bibliotheca/control.sock")]
+    #[arg(
+        long,
+        env = "BIBLIOTHECA_SOCKET",
+        default_value = "/run/bibliotheca/control.sock"
+    )]
     socket: PathBuf,
 
     /// Sqlite metadata database path.
-    #[arg(long, env = "BIBLIOTHECA_DB", default_value = "/var/lib/bibliotheca/bibliotheca.db")]
+    #[arg(
+        long,
+        env = "BIBLIOTHECA_DB",
+        default_value = "/var/lib/bibliotheca/bibliotheca.db"
+    )]
     db: PathBuf,
 
     /// Filesystem root under which subvolumes are created.
-    #[arg(long, env = "BIBLIOTHECA_ROOT", default_value = "/var/lib/bibliotheca/subvolumes")]
+    #[arg(
+        long,
+        env = "BIBLIOTHECA_ROOT",
+        default_value = "/var/lib/bibliotheca/subvolumes"
+    )]
     root: PathBuf,
 
     /// Path to the btrfs binary.

@@ -199,11 +199,9 @@ async fn group_membership_lifecycle() {
     assert!(bob.group_ids.contains(&g.id));
 
     // Deleting the group should cascade membership.
-    id.delete_group(pb::DeleteGroupRequest {
-        id: g.id.clone(),
-    })
-    .await
-    .unwrap();
+    id.delete_group(pb::DeleteGroupRequest { id: g.id.clone() })
+        .await
+        .unwrap();
     let bob = id
         .get_user(pb::GetUserRequest {
             id_or_name: "bob".into(),

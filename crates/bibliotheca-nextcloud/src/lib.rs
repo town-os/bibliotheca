@@ -28,7 +28,10 @@ pub async fn start(svc: BibliothecaService, cfg: NextcloudConfig) -> anyhow::Res
     let state = Arc::new(AppState { svc });
     let app = Router::new()
         .route("/remote.php/dav/files/:user/*path", any(dav_op))
-        .route("/ocs/v2.php/apps/files_sharing/api/v1/shares", any(shares_op))
+        .route(
+            "/ocs/v2.php/apps/files_sharing/api/v1/shares",
+            any(shares_op),
+        )
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(cfg.listen)
         .await

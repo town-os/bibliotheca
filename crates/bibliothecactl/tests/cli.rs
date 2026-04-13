@@ -40,11 +40,8 @@ async fn spawn_daemon() -> Daemon {
     let svc = BibliothecaService::new(store, dyn_backend);
 
     let socket_for_server = socket.clone();
-    let handle = tokio::spawn(async move {
-        bibliothecad::control::serve(svc, socket_for_server)
-            .await
-            .map_err(anyhow::Error::from)
-    });
+    let handle =
+        tokio::spawn(async move { bibliothecad::control::serve(svc, socket_for_server).await });
 
     for _ in 0..100 {
         if socket.exists() {
@@ -106,7 +103,15 @@ async fn user_lifecycle_via_cli() {
 
     let create = run_ctl(
         &d.socket,
-        &["user", "create", "alice", "--password", "pw", "--display", "Alice"],
+        &[
+            "user",
+            "create",
+            "alice",
+            "--password",
+            "pw",
+            "--display",
+            "Alice",
+        ],
     )
     .await;
     assert_eq!(create.code, 0, "stderr: {}", create.stderr);
@@ -131,11 +136,7 @@ async fn user_lifecycle_via_cli() {
 async fn group_and_subvolume_flow_via_cli() {
     let d = spawn_daemon().await;
 
-    let u = run_ctl(
-        &d.socket,
-        &["user", "create", "alice", "--password", "pw"],
-    )
-    .await;
+    let u = run_ctl(&d.socket, &["user", "create", "alice", "--password", "pw"]).await;
     assert_eq!(u.code, 0, "stderr: {}", u.stderr);
     let uid = first_col(&u.stdout).to_string();
 
@@ -202,7 +203,11 @@ async fn cli_reports_not_found_via_nonzero_exit() {
         &["user", "delete", "00000000-0000-0000-0000-000000000000"],
     )
     .await;
-    assert_ne!(out.code, 0, "expected failure exit, got stdout={:?}", out.stdout);
+    assert_ne!(
+        out.code, 0,
+        "expected failure exit, got stdout={:?}",
+        out.stdout
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

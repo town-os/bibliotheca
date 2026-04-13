@@ -124,9 +124,14 @@ pub fn spawn_enabled(svc: BibliothecaService, ifaces: &InterfaceFile) {
                         return;
                     }
                 };
-                if let Err(e) =
-                    bibliotheca_solid::start(svc, bibliotheca_solid::SolidConfig { listen: addr, base_url })
-                        .await
+                if let Err(e) = bibliotheca_solid::start(
+                    svc,
+                    bibliotheca_solid::SolidConfig {
+                        listen: addr,
+                        base_url,
+                    },
+                )
+                .await
                 {
                     warn!(error = %e, "solid interface exited");
                 }
@@ -136,21 +141,35 @@ pub fn spawn_enabled(svc: BibliothecaService, ifaces: &InterfaceFile) {
 
     if let Some(cfg) = &ifaces.dropbox {
         if cfg.enabled {
-            spawn_listen(svc.clone(), &cfg.listen, "dropbox", |svc, addr| async move {
-                bibliotheca_dropbox::start(svc, bibliotheca_dropbox::DropboxConfig { listen: addr }).await
-            });
+            spawn_listen(
+                svc.clone(),
+                &cfg.listen,
+                "dropbox",
+                |svc, addr| async move {
+                    bibliotheca_dropbox::start(
+                        svc,
+                        bibliotheca_dropbox::DropboxConfig { listen: addr },
+                    )
+                    .await
+                },
+            );
         }
     }
 
     if let Some(cfg) = &ifaces.nextcloud {
         if cfg.enabled {
-            spawn_listen(svc.clone(), &cfg.listen, "nextcloud", |svc, addr| async move {
-                bibliotheca_nextcloud::start(
-                    svc,
-                    bibliotheca_nextcloud::NextcloudConfig { listen: addr },
-                )
-                .await
-            });
+            spawn_listen(
+                svc.clone(),
+                &cfg.listen,
+                "nextcloud",
+                |svc, addr| async move {
+                    bibliotheca_nextcloud::start(
+                        svc,
+                        bibliotheca_nextcloud::NextcloudConfig { listen: addr },
+                    )
+                    .await
+                },
+            );
         }
     }
 

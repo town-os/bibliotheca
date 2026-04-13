@@ -5,7 +5,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .join("..")
         .join("..")
         .join("proto");
-    let proto_file = proto_root.join("bibliotheca").join("v1").join("control.proto");
+    let proto_file = proto_root
+        .join("bibliotheca")
+        .join("v1")
+        .join("control.proto");
 
     tonic_build::configure()
         .build_client(true)

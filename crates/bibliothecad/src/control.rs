@@ -182,7 +182,12 @@ fn acl_to_pb(acl: &Acl) -> pb::Acl {
                 pb::AclEntry {
                     principal_kind: kind,
                     principal_id: id,
-                    permissions: e.permissions.iter().copied().map(permission_to_pb).collect(),
+                    permissions: e
+                        .permissions
+                        .iter()
+                        .copied()
+                        .map(permission_to_pb)
+                        .collect(),
                 }
             })
             .collect(),
@@ -279,7 +284,9 @@ impl Identity for IdentitySvc {
     ) -> Result<Response<()>, Status> {
         let r = req.into_inner();
         let id = parse_user_id(&r.id)?;
-        self.svc.set_user_password(id, &r.password).map_err(to_status)?;
+        self.svc
+            .set_user_password(id, &r.password)
+            .map_err(to_status)?;
         Ok(Response::new(()))
     }
 
@@ -288,7 +295,10 @@ impl Identity for IdentitySvc {
         req: Request<pb::CreateGroupRequest>,
     ) -> Result<Response<pb::Group>, Status> {
         let r = req.into_inner();
-        let g = self.svc.create_group(&r.name, &r.description).map_err(to_status)?;
+        let g = self
+            .svc
+            .create_group(&r.name, &r.description)
+            .map_err(to_status)?;
         Ok(Response::new(group_to_pb(g)))
     }
 
@@ -405,7 +415,10 @@ impl Storage for StorageSvc {
     ) -> Result<Response<()>, Status> {
         let r = req.into_inner();
         let id = parse_sv_id(&r.id)?;
-        self.svc.delete_subvolume(id, r.force).await.map_err(to_status)?;
+        self.svc
+            .delete_subvolume(id, r.force)
+            .await
+            .map_err(to_status)?;
         Ok(Response::new(()))
     }
 
@@ -435,10 +448,7 @@ impl Storage for StorageSvc {
         Ok(Response::new(subvolume_to_pb(sv)))
     }
 
-    async fn get_acl(
-        &self,
-        req: Request<pb::GetAclRequest>,
-    ) -> Result<Response<pb::Acl>, Status> {
+    async fn get_acl(&self, req: Request<pb::GetAclRequest>) -> Result<Response<pb::Acl>, Status> {
         let r = req.into_inner();
         let sv = self
             .svc
@@ -496,7 +506,9 @@ impl Interfaces for InterfacesSvc {
         &self,
         _req: Request<pb::GetInterfaceRequest>,
     ) -> Result<Response<pb::InterfaceConfig>, Status> {
-        Err(Status::unimplemented("dynamic interface mgmt not yet wired"))
+        Err(Status::unimplemented(
+            "dynamic interface mgmt not yet wired",
+        ))
     }
     async fn list(
         &self,
@@ -510,19 +522,25 @@ impl Interfaces for InterfacesSvc {
         &self,
         _req: Request<pb::InterfaceConfig>,
     ) -> Result<Response<pb::InterfaceConfig>, Status> {
-        Err(Status::unimplemented("dynamic interface mgmt not yet wired"))
+        Err(Status::unimplemented(
+            "dynamic interface mgmt not yet wired",
+        ))
     }
     async fn enable(
         &self,
         _req: Request<pb::EnableInterfaceRequest>,
     ) -> Result<Response<pb::InterfaceConfig>, Status> {
-        Err(Status::unimplemented("dynamic interface mgmt not yet wired"))
+        Err(Status::unimplemented(
+            "dynamic interface mgmt not yet wired",
+        ))
     }
     async fn disable(
         &self,
         _req: Request<pb::DisableInterfaceRequest>,
     ) -> Result<Response<pb::InterfaceConfig>, Status> {
-        Err(Status::unimplemented("dynamic interface mgmt not yet wired"))
+        Err(Status::unimplemented(
+            "dynamic interface mgmt not yet wired",
+        ))
     }
 }
 

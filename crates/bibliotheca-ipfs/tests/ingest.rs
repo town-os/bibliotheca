@@ -103,7 +103,10 @@ async fn import_and_export_round_trip() {
     let src = sv.mount_path.join("hello.txt");
     std::fs::write(&src, b"hello, ipfs").unwrap();
 
-    let cid = ipfs.import(sv.id, &PathBuf::from("hello.txt")).await.unwrap();
+    let cid = ipfs
+        .import(sv.id, &PathBuf::from("hello.txt"))
+        .await
+        .unwrap();
     assert!(cid.starts_with("Qm"));
 
     // Export into a fresh relative path under the same subvolume.
@@ -181,7 +184,10 @@ async fn export_creates_parent_directories() {
     // Seed the fake with a known blob.
     let src = sv.mount_path.join("seed.txt");
     std::fs::write(&src, b"seed").unwrap();
-    let cid = ipfs.import(sv.id, &PathBuf::from("seed.txt")).await.unwrap();
+    let cid = ipfs
+        .import(sv.id, &PathBuf::from("seed.txt"))
+        .await
+        .unwrap();
 
     // Confirm it's in the fake store (guard against the fake eating writes).
     assert!(fake.inner.lock().blobs.contains_key(&cid));

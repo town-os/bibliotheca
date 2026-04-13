@@ -68,7 +68,9 @@ async fn bucket_route_registered() {
 async fn object_route_registered() {
     let (_tmp, addr) = spawn().await;
     let resp = client()
-        .get(format!("http://{addr}/storage/v1/b/my-bucket/o/path/to/obj"))
+        .get(format!(
+            "http://{addr}/storage/v1/b/my-bucket/o/path/to/obj"
+        ))
         .send()
         .await
         .unwrap();

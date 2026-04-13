@@ -90,7 +90,10 @@ async fn create_subvolume_rejects_path_traversal_name() {
 async fn delete_subvolume_requires_force_with_snapshots() {
     let (_tmp, svc, _backend) = harness();
     let alice = svc.create_user("alice", "Alice", "p").unwrap();
-    let sv = svc.create_subvolume("docs", alice.id, 0, None).await.unwrap();
+    let sv = svc
+        .create_subvolume("docs", alice.id, 0, None)
+        .await
+        .unwrap();
     svc.create_snapshot(sv.id, "s1", true).await.unwrap();
 
     let err = svc.delete_subvolume(sv.id, false).await.unwrap_err();
@@ -105,7 +108,10 @@ async fn delete_subvolume_requires_force_with_snapshots() {
 async fn quota_update_reaches_backend_and_store() {
     let (_tmp, svc, backend) = harness();
     let alice = svc.create_user("alice", "Alice", "p").unwrap();
-    let sv = svc.create_subvolume("docs", alice.id, 0, None).await.unwrap();
+    let sv = svc
+        .create_subvolume("docs", alice.id, 0, None)
+        .await
+        .unwrap();
     // No quota set_quota op because original was 0.
     assert!(!backend
         .ops()
@@ -197,13 +203,17 @@ async fn acl_admin_implies_all_permissions() {
         principal: Principal::User(carol.id),
         permissions: [Admin].into_iter().collect(),
     });
-    let sv = svc.create_subvolume("c", owner.id, 0, Some(acl)).await.unwrap();
+    let sv = svc
+        .create_subvolume("c", owner.id, 0, Some(acl))
+        .await
+        .unwrap();
 
     for p in [Read, Write, List, Delete, Admin] {
-        assert!(svc
-            .check_permission(sv.id, Some(carol.id), p, false)
-            .unwrap(),
-            "admin should imply {p:?}");
+        assert!(
+            svc.check_permission(sv.id, Some(carol.id), p, false)
+                .unwrap(),
+            "admin should imply {p:?}"
+        );
     }
 }
 
@@ -211,12 +221,27 @@ async fn acl_admin_implies_all_permissions() {
 async fn verify_user_password_round_trip() {
     let (_tmp, svc, _backend) = harness();
     let alice = svc.create_user("alice", "Alice", "s3cret").unwrap();
-    assert!(svc.verify_user_password("alice", "s3cret").unwrap().is_some());
-    assert!(svc.verify_user_password("alice", "wrong").unwrap().is_none());
-    assert!(svc.verify_user_password("nobody", "s3cret").unwrap().is_none());
+    assert!(svc
+        .verify_user_password("alice", "s3cret")
+        .unwrap()
+        .is_some());
+    assert!(svc
+        .verify_user_password("alice", "wrong")
+        .unwrap()
+        .is_none());
+    assert!(svc
+        .verify_user_password("nobody", "s3cret")
+        .unwrap()
+        .is_none());
     svc.set_user_password(alice.id, "rotated").unwrap();
-    assert!(svc.verify_user_password("alice", "s3cret").unwrap().is_none());
-    assert!(svc.verify_user_password("alice", "rotated").unwrap().is_some());
+    assert!(svc
+        .verify_user_password("alice", "s3cret")
+        .unwrap()
+        .is_none());
+    assert!(svc
+        .verify_user_password("alice", "rotated")
+        .unwrap()
+        .is_some());
 }
 
 #[tokio::test]
@@ -242,7 +267,10 @@ async fn group_ids_for_user_is_sorted_and_consistent() {
 async fn snapshot_preserves_content_under_memory_backend() {
     let (_tmp, svc, _backend) = harness();
     let alice = svc.create_user("alice", "Alice", "p").unwrap();
-    let sv = svc.create_subvolume("docs", alice.id, 0, None).await.unwrap();
+    let sv = svc
+        .create_subvolume("docs", alice.id, 0, None)
+        .await
+        .unwrap();
     std::fs::write(sv.mount_path.join("hello.txt"), b"hi").unwrap();
     let snap = svc.create_snapshot(sv.id, "s1", true).await.unwrap();
     assert!(snap.mount_path.join("hello.txt").exists());

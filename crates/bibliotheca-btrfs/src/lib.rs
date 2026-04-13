@@ -109,13 +109,8 @@ impl SubvolumeBackend for BtrfsBackend {
         } else {
             bytes.to_string()
         };
-        self.run(&[
-            "qgroup",
-            "limit",
-            &limit,
-            &path.display().to_string(),
-        ])
-        .await
+        self.run(&["qgroup", "limit", &limit, &path.display().to_string()])
+            .await
     }
 
     async fn snapshot(&self, source: &Path, dest: &Path, readonly: bool) -> Result<()> {

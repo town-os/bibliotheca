@@ -3,8 +3,6 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
-use hyper_util::rt::TokioIo;
 use bibliotheca_proto::v1::identity_client::IdentityClient;
 use bibliotheca_proto::v1::storage_client::StorageClient;
 use bibliotheca_proto::v1::{
@@ -12,6 +10,8 @@ use bibliotheca_proto::v1::{
     DeleteSubvolumeRequest, DeleteUserRequest, ListGroupsRequest, ListSubvolumesRequest,
     ListUsersRequest, SetQuotaRequest,
 };
+use clap::{Parser, Subcommand};
+use hyper_util::rt::TokioIo;
 use tokio::net::UnixStream;
 use tonic::transport::{Endpoint, Uri};
 use tower::service_fn;
@@ -19,7 +19,11 @@ use tower::service_fn;
 #[derive(Debug, Parser)]
 #[command(name = "bibliothecactl", version, about = "Bibliotheca control client")]
 struct Args {
-    #[arg(long, env = "BIBLIOTHECA_SOCKET", default_value = "/run/bibliotheca/control.sock")]
+    #[arg(
+        long,
+        env = "BIBLIOTHECA_SOCKET",
+        default_value = "/run/bibliotheca/control.sock"
+    )]
     socket: PathBuf,
 
     #[command(subcommand)]
@@ -212,7 +216,9 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 SubvolumeCmd::Delete { id, force } => {
-                    client.delete_subvolume(DeleteSubvolumeRequest { id, force }).await?;
+                    client
+                        .delete_subvolume(DeleteSubvolumeRequest { id, force })
+                        .await?;
                 }
                 SubvolumeCmd::Quota { id, bytes } => {
                     client

@@ -150,7 +150,11 @@ impl Store {
             "SELECT id, name, display_name, created_at, disabled FROM users
              ORDER BY name LIMIT ?1 OFFSET ?2",
         )?;
-        let limit = if limit == 0 { i64::MAX } else { i64::from(limit) };
+        let limit = if limit == 0 {
+            i64::MAX
+        } else {
+            i64::from(limit)
+        };
         let rows = stmt
             .query_map(params![limit, i64::from(offset)], row_to_user)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -245,7 +249,11 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT id, name, description, created_at FROM groups ORDER BY name LIMIT ?1 OFFSET ?2",
         )?;
-        let limit = if limit == 0 { i64::MAX } else { i64::from(limit) };
+        let limit = if limit == 0 {
+            i64::MAX
+        } else {
+            i64::from(limit)
+        };
         let rows = stmt
             .query_map(params![limit, i64::from(offset)], row_to_group)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -281,8 +289,7 @@ impl Store {
 
     pub fn groups_for_user(&self, user: UserId) -> Result<HashSet<GroupId>> {
         let conn = self.inner.lock();
-        let mut stmt =
-            conn.prepare("SELECT group_id FROM group_members WHERE user_id = ?1")?;
+        let mut stmt = conn.prepare("SELECT group_id FROM group_members WHERE user_id = ?1")?;
         let rows = stmt
             .query_map(params![user.to_string()], |r| {
                 let s: String = r.get(0)?;
@@ -383,7 +390,11 @@ impl Store {
         offset: u32,
     ) -> Result<Vec<Subvolume>> {
         let conn = self.inner.lock();
-        let limit = if limit == 0 { i64::MAX } else { i64::from(limit) };
+        let limit = if limit == 0 {
+            i64::MAX
+        } else {
+            i64::from(limit)
+        };
         let offset = i64::from(offset);
         let rows: Vec<Subvolume> = match owner {
             Some(o) => {
@@ -391,12 +402,9 @@ impl Store {
                     "SELECT id, name, owner_id, mount_path, quota_bytes, acl_json, created_at
                      FROM subvolumes WHERE owner_id = ?1 ORDER BY name LIMIT ?2 OFFSET ?3",
                 )?;
-                let iter = stmt.query_map(
-                    params![o.to_string(), limit, offset],
-                    row_to_subvolume,
-                )?;
-                let v = iter.collect::<std::result::Result<Vec<_>, _>>()?;
-                v
+                let iter =
+                    stmt.query_map(params![o.to_string(), limit, offset], row_to_subvolume)?;
+                iter.collect::<std::result::Result<Vec<_>, _>>()?
             }
             None => {
                 let mut stmt = conn.prepare(
@@ -404,8 +412,7 @@ impl Store {
                      FROM subvolumes ORDER BY name LIMIT ?1 OFFSET ?2",
                 )?;
                 let iter = stmt.query_map(params![limit, offset], row_to_subvolume)?;
-                let v = iter.collect::<std::result::Result<Vec<_>, _>>()?;
-                v
+                iter.collect::<std::result::Result<Vec<_>, _>>()?
             }
         };
         Ok(rows)
@@ -543,7 +550,7 @@ fn row_to_user(r: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
         name: r.get(1)?,
         display_name: r.get(2)?,
         created_at: OffsetDateTime::from_unix_timestamp(created)
-            .unwrap_or_else(|_| OffsetDateTime::UNIX_EPOCH),
+            .unwrap_or(OffsetDateTime::UNIX_EPOCH),
         disabled: disabled != 0,
     })
 }
@@ -556,7 +563,7 @@ fn row_to_group(r: &rusqlite::Row<'_>) -> rusqlite::Result<Group> {
         name: r.get(1)?,
         description: r.get(2)?,
         created_at: OffsetDateTime::from_unix_timestamp(created)
-            .unwrap_or_else(|_| OffsetDateTime::UNIX_EPOCH),
+            .unwrap_or(OffsetDateTime::UNIX_EPOCH),
     })
 }
 
@@ -577,7 +584,7 @@ fn row_to_subvolume(r: &rusqlite::Row<'_>) -> rusqlite::Result<Subvolume> {
         quota_bytes: quota.max(0) as u64,
         acl,
         created_at: OffsetDateTime::from_unix_timestamp(created)
-            .unwrap_or_else(|_| OffsetDateTime::UNIX_EPOCH),
+            .unwrap_or(OffsetDateTime::UNIX_EPOCH),
     })
 }
 
@@ -594,16 +601,14 @@ fn row_to_snapshot(r: &rusqlite::Row<'_>) -> rusqlite::Result<Snapshot> {
         mount_path: PathBuf::from(mount),
         readonly: ro != 0,
         created_at: OffsetDateTime::from_unix_timestamp(created)
-            .unwrap_or_else(|_| OffsetDateTime::UNIX_EPOCH),
+            .unwrap_or(OffsetDateTime::UNIX_EPOCH),
     })
 }
 
 fn parse_uuid(s: &str) -> rusqlite::Result<Uuid> {
-    Uuid::parse_str(s).map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-        0,
-        rusqlite::types::Type::Text,
-        Box::new(e),
-    ))
+    Uuid::parse_str(s).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })
 }
 
 #[cfg(test)]

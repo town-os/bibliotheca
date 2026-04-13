@@ -15,11 +15,34 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use bibliotheca_btrfs::BtrfsBackend;
 use bibliotheca_core::backend::SubvolumeBackend;
 use bibliotheca_core::error::Error;
 use tempfile::TempDir;
+use tokio::sync::{Mutex, MutexGuard};
+
+/// Serialize the whole test body.
+///
+/// These tests write a fake `btrfs` script to a tempdir and then
+/// `exec` it. If another test is mid-`std::fs::write` on its own copy
+/// when we fork to exec ours, the forked child inherits that other
+/// test's still-open write fd, and Linux's ETXTBSY check triggers on
+/// the exec target. The race is narrow but reproducible under cargo's
+/// parallel test runner — holding this mutex for the duration of each
+/// test is the cheapest robust fix.
+///
+/// `tokio::sync::Mutex` (not `std::sync::Mutex`) because the guard is
+/// held across `.await` points.
+fn serial_mutex() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+async fn serial() -> MutexGuard<'static, ()> {
+    serial_mutex().lock().await
+}
 
 /// Writes a fake `btrfs` shell script that records every invocation's
 /// argv into `log` and optionally exits non-zero. No env vars are used,
@@ -91,6 +114,7 @@ fn invocations(log: &Path) -> Vec<Vec<String>> {
 
 #[tokio::test]
 async fn create_subvolume_args() {
+    let _g = serial().await;
     let h = harness(false);
     let path = h.backend.path_for("photos");
     h.backend.create_subvolume(&path).await.unwrap();
@@ -111,6 +135,7 @@ async fn create_subvolume_args() {
 
 #[tokio::test]
 async fn delete_subvolume_args_include_commit_after() {
+    let _g = serial().await;
     let h = harness(false);
     let path = h.backend.path_for("photos");
     // delete_subvolume doesn't create the directory itself; the real
@@ -132,6 +157,7 @@ async fn delete_subvolume_args_include_commit_after() {
 
 #[tokio::test]
 async fn set_quota_none_when_zero() {
+    let _g = serial().await;
     let h = harness(false);
     let path = h.backend.path_for("photos");
     h.backend.set_quota(&path, 0).await.unwrap();
@@ -151,6 +177,7 @@ async fn set_quota_none_when_zero() {
 
 #[tokio::test]
 async fn set_quota_positive() {
+    let _g = serial().await;
     let h = harness(false);
     let path = h.backend.path_for("photos");
     h.backend.set_quota(&path, 1073741824).await.unwrap();
@@ -162,6 +189,7 @@ async fn set_quota_positive() {
 
 #[tokio::test]
 async fn snapshot_readonly_flag() {
+    let _g = serial().await;
     let h = harness(false);
     let src = h.backend.path_for("docs");
     std::fs::create_dir_all(&src).unwrap();
@@ -184,6 +212,7 @@ async fn snapshot_readonly_flag() {
 
 #[tokio::test]
 async fn snapshot_without_readonly() {
+    let _g = serial().await;
     let h = harness(false);
     let src = h.backend.path_for("docs");
     std::fs::create_dir_all(&src).unwrap();
@@ -198,6 +227,7 @@ async fn snapshot_without_readonly() {
 
 #[tokio::test]
 async fn non_zero_exit_becomes_backend_error() {
+    let _g = serial().await;
     let h = harness(true);
     let path = h.backend.path_for("photos");
     let err = h.backend.create_subvolume(&path).await.unwrap_err();
@@ -216,10 +246,7 @@ async fn real_btrfs_round_trip() {
     let root = std::env::var("BIBLIOTHECA_REAL_BTRFS_ROOT")
         .expect("set BIBLIOTHECA_REAL_BTRFS_ROOT to a writable btrfs directory");
     let backend = BtrfsBackend::new(PathBuf::from(root));
-    let name = format!(
-        "bibliotheca-test-{}",
-        std::process::id()
-    );
+    let name = format!("bibliotheca-test-{}", std::process::id());
     let path = backend.path_for(&name);
 
     backend

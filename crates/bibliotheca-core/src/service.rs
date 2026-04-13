@@ -206,7 +206,9 @@ impl BibliothecaService {
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        self.backend.snapshot(&sv.mount_path, &dest, readonly).await?;
+        self.backend
+            .snapshot(&sv.mount_path, &dest, readonly)
+            .await?;
         self.store.create_snapshot(sv_id, name, dest, readonly)
     }
 
@@ -229,6 +231,7 @@ impl BibliothecaService {
         wanted: Permission,
         public_allowed: bool,
     ) -> Result<bool> {
-        self.store.check_permission(sv, user, wanted, public_allowed)
+        self.store
+            .check_permission(sv, user, wanted, public_allowed)
     }
 }
