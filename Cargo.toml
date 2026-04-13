@@ -71,6 +71,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 parking_lot = "0.12"
 url = "2"
 tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [profile.release]
 lto = "thin"
