@@ -5,6 +5,7 @@
 //! command-line driven so it can be supervised by town-os's existing
 //! systemd-shaped service manager.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -18,8 +19,9 @@ use tracing::info;
 use tracing_subscriber::{prelude::*, EnvFilter};
 use url::Url;
 
+use bibliothecad::anisette::AnisetteBootConfig;
 use bibliothecad::sync::SyncBootConfig;
-use bibliothecad::{control, interfaces, sync};
+use bibliothecad::{anisette, control, interfaces, sync};
 
 const DEFAULT_SYNC_QUOTA: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
 
@@ -99,6 +101,40 @@ struct Args {
     /// create request does not specify one.
     #[arg(long, default_value_t = DEFAULT_SYNC_QUOTA)]
     sync_default_quota_bytes: u64,
+
+    /// TCP address to bind the embedded anisette proxy on. Only
+    /// spawned if at least one `--anisette-upstream` is supplied.
+    #[arg(
+        long,
+        env = "BIBLIOTHECA_ANISETTE_LISTEN",
+        default_value = "127.0.0.1:6969"
+    )]
+    anisette_listen: SocketAddr,
+
+    /// Upstream anisette URL. Repeatable. All upstreams must be
+    /// operator-controlled endpoints — typically peer bibliotheca
+    /// instances reachable over a VPN and resolved via private
+    /// DNS. Without any upstreams, the proxy stays disabled and
+    /// `sync-icloud` mounts must point at an `anisette_url`
+    /// themselves.
+    #[arg(
+        long = "anisette-upstream",
+        env = "BIBLIOTHECA_ANISETTE_UPSTREAMS",
+        value_delimiter = ','
+    )]
+    anisette_upstreams: Vec<Url>,
+
+    /// TTL (seconds) for cached anisette responses.
+    #[arg(long, default_value_t = 20)]
+    anisette_cache_ttl_secs: u64,
+
+    /// Per-request timeout (seconds) for the anisette upstreams.
+    #[arg(long, default_value_t = 10)]
+    anisette_request_timeout_secs: u64,
+
+    /// Backoff (seconds) for a failed anisette upstream.
+    #[arg(long, default_value_t = 60)]
+    anisette_backoff_secs: u64,
 }
 
 #[tokio::main]
@@ -143,7 +179,23 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    control::serve(svc, supervisor, args.socket.clone()).await?;
+    let anisette_cfg = if args.anisette_upstreams.is_empty() {
+        None
+    } else {
+        Some(AnisetteBootConfig {
+            listen: args.anisette_listen,
+            upstreams: args.anisette_upstreams.clone(),
+            cache_ttl_secs: args.anisette_cache_ttl_secs,
+            request_timeout_secs: args.anisette_request_timeout_secs,
+            backoff_secs: args.anisette_backoff_secs,
+        })
+    };
+    let anisette_provider = anisette::boot(anisette_cfg, shutdown.clone());
+    let anisette_for_ctl = anisette_provider
+        .clone()
+        .map(|p| (p, args.anisette_listen.to_string()));
+
+    control::serve(svc, supervisor, anisette_for_ctl, args.socket.clone()).await?;
     shutdown.cancel();
     info!("bibliothecad shutting down");
     Ok(())

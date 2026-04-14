@@ -1,0 +1,31 @@
+[package]
+name = "bibliotheca-anisette"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+axum = { workspace = true, features = ["macros"] }
+tokio = { workspace = true, features = ["full"] }
+tower.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+parking_lot.workspace = true
+time = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+clap.workspace = true
+url.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+axum = { workspace = true, features = ["macros"] }
+reqwest = { workspace = true, features = ["json"] }
+
+[[bin]]
+name = "bibliotheca-anisetted"
+path = "src/bin/bibliotheca-anisetted.rs"

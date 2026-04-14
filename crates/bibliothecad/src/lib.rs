@@ -8,6 +8,7 @@
 // be viral and gain us nothing, so we turn off the lint here.
 #![allow(clippy::result_large_err)]
 
+pub mod anisette;
 pub mod control;
 pub mod interfaces;
 pub mod sync;

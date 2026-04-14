@@ -3,6 +3,7 @@
 
 use std::path::PathBuf;
 
+use bibliotheca_proto::v1::anisette_admin_client::AnisetteAdminClient;
 use bibliotheca_proto::v1::identity_client::IdentityClient;
 use bibliotheca_proto::v1::storage_client::StorageClient;
 use bibliotheca_proto::v1::sync_admin_client::SyncAdminClient;
@@ -52,6 +53,21 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SyncCmd,
     },
+    /// Embedded anisette proxy.
+    Anisette {
+        #[command(subcommand)]
+        cmd: AnisetteCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AnisetteCmd {
+    /// Print the proxy's current state: upstreams, call counts,
+    /// last success timestamp, cached-until.
+    Status,
+    /// Clear the cached OTP and upstream backoff state so the next
+    /// request hits upstream fresh.
+    Reset,
 }
 
 #[derive(Debug, Subcommand)]
@@ -294,6 +310,37 @@ async fn main() -> anyhow::Result<()> {
                     client
                         .add_user_to_group(AddUserToGroupRequest { user_id, group_id })
                         .await?;
+                }
+            }
+        }
+        Cmd::Anisette { cmd } => {
+            let mut client = AnisetteAdminClient::new(channel);
+            match cmd {
+                AnisetteCmd::Status => {
+                    let s = client.status(()).await?.into_inner();
+                    if !s.enabled {
+                        println!("anisette\tdisabled");
+                    } else {
+                        println!(
+                            "kind\t{kind}\nlisten\t{listen}\nlast_success_at\t{last}\ncached_until\t{cached}",
+                            kind = s.kind,
+                            listen = s.listen,
+                            last = s.last_success_at,
+                            cached = s.cached_until
+                        );
+                        for u in s.upstreams {
+                            println!(
+                                "upstream\t{url}\tok={ok}\terr={err}\t{last}",
+                                url = u.url,
+                                ok = u.ok_count,
+                                err = u.err_count,
+                                last = u.last_error
+                            );
+                        }
+                    }
+                }
+                AnisetteCmd::Reset => {
+                    client.reset(()).await?;
                 }
             }
         }

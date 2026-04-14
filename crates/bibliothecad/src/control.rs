@@ -10,11 +10,13 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use bibliotheca_anisette::AnisetteProvider;
 use bibliotheca_core::acl::{Acl, AclEntry, Permission, Principal};
 use bibliotheca_core::error::Error;
 use bibliotheca_core::identity::{GroupId, UserId};
 use bibliotheca_core::service::BibliothecaService;
 use bibliotheca_core::subvolume::{SnapshotId, SubvolumeId};
+use bibliotheca_proto::v1::anisette_admin_server::{AnisetteAdmin, AnisetteAdminServer};
 use bibliotheca_proto::v1::identity_server::{Identity, IdentityServer};
 use bibliotheca_proto::v1::interfaces_server::{Interfaces, InterfacesServer};
 use bibliotheca_proto::v1::ipfs_server::{Ipfs, IpfsServer};
@@ -35,6 +37,7 @@ use uuid::Uuid;
 pub async fn serve(
     svc: BibliothecaService,
     supervisor: Option<Arc<Supervisor>>,
+    anisette: Option<(Arc<dyn AnisetteProvider>, String)>,
     socket: PathBuf,
 ) -> anyhow::Result<()> {
     if socket.exists() {
@@ -51,6 +54,7 @@ pub async fn serve(
     let sync = SyncAdminSvc {
         supervisor: supervisor.clone(),
     };
+    let anisette_admin = AnisetteAdminSvc { provider: anisette };
 
     Server::builder()
         .add_service(IdentityServer::new(identity))
@@ -58,6 +62,7 @@ pub async fn serve(
         .add_service(InterfacesServer::new(interfaces))
         .add_service(IpfsServer::new(ipfs))
         .add_service(SyncAdminServer::new(sync))
+        .add_service(AnisetteAdminServer::new(anisette_admin))
         .serve_with_incoming(stream)
         .await?;
     Ok(())
@@ -947,6 +952,56 @@ impl SyncAdmin for SyncAdminSvc {
             .await
             .map_err(sync_err)?;
         info!(rotated = n, "sync secret key rotated");
+        Ok(Response::new(()))
+    }
+}
+
+// ---------- AnisetteAdmin ----------
+
+pub struct AnisetteAdminSvc {
+    /// `None` means the anisette proxy was not configured at boot.
+    /// Every RPC returns `Unavailable` in that case.
+    provider: Option<(Arc<dyn AnisetteProvider>, String)>,
+}
+
+#[tonic::async_trait]
+impl AnisetteAdmin for AnisetteAdminSvc {
+    async fn status(&self, _req: Request<()>) -> Result<Response<pb::AnisetteStatus>, Status> {
+        let Some((provider, listen)) = &self.provider else {
+            return Ok(Response::new(pb::AnisetteStatus {
+                enabled: false,
+                kind: String::new(),
+                upstreams: vec![],
+                last_success_at: 0,
+                cached_until: 0,
+                listen: String::new(),
+            }));
+        };
+        let s = provider.status();
+        Ok(Response::new(pb::AnisetteStatus {
+            enabled: true,
+            kind: s.kind,
+            upstreams: s
+                .upstreams
+                .into_iter()
+                .map(|u| pb::AnisetteUpstreamHealth {
+                    url: u.url,
+                    ok_count: u.ok_count,
+                    err_count: u.err_count,
+                    last_error: u.last_error.unwrap_or_default(),
+                })
+                .collect(),
+            last_success_at: s.last_success_at.unwrap_or(0),
+            cached_until: s.cached_until.unwrap_or(0),
+            listen: listen.clone(),
+        }))
+    }
+
+    async fn reset(&self, _req: Request<()>) -> Result<Response<()>, Status> {
+        let Some((provider, _)) = &self.provider else {
+            return Err(Status::unavailable("anisette proxy disabled"));
+        };
+        provider.reset();
         Ok(Response::new(()))
     }
 }

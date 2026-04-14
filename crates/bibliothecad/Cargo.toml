@@ -30,6 +30,7 @@ bibliotheca-sync-nextcloud.workspace = true
 bibliotheca-sync-solid.workspace = true
 bibliotheca-sync-gphotos.workspace = true
 bibliotheca-sync-icloud.workspace = true
+bibliotheca-anisette.workspace = true
 
 anyhow.workspace = true
 async-trait.workspace = true

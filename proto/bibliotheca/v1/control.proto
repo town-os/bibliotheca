@@ -350,6 +350,36 @@ message SyncEvent {
   map<string, string> details = 6;
 }
 
+// =====================================================================
+// AnisetteAdmin — surfaces the bibliotheca-anisette proxy that runs
+// alongside the daemon for operators who point sync-icloud mounts at
+// a local endpoint. The proxy forwards to operator-controlled
+// upstream anisette servers (typically peer bibliotheca nodes
+// reachable over a VPN); this RPC only exposes introspection +
+// cache reset, never upstream-credential material.
+// =====================================================================
+
+message AnisetteStatus {
+  bool enabled = 1;
+  string kind = 2;                       // "proxy" | "mock"
+  repeated AnisetteUpstreamHealth upstreams = 3;
+  int64 last_success_at = 4;
+  int64 cached_until = 5;
+  string listen = 6;
+}
+
+message AnisetteUpstreamHealth {
+  string url = 1;
+  uint64 ok_count = 2;
+  uint64 err_count = 3;
+  string last_error = 4;
+}
+
+service AnisetteAdmin {
+  rpc Status(google.protobuf.Empty) returns (AnisetteStatus);
+  rpc Reset(google.protobuf.Empty) returns (google.protobuf.Empty);
+}
+
 service SyncAdmin {
   rpc CreateMount(CreateMountRequest) returns (SyncMount);
   rpc ListMounts(google.protobuf.Empty) returns (ListMountsResponse);

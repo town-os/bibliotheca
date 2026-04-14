@@ -40,10 +40,9 @@ async fn spawn_daemon() -> Daemon {
     let svc = BibliothecaService::new(store, dyn_backend);
 
     let socket_for_server = socket.clone();
-    let handle =
-        tokio::spawn(
-            async move { bibliothecad::control::serve(svc, None, socket_for_server).await },
-        );
+    let handle = tokio::spawn(async move {
+        bibliothecad::control::serve(svc, None, None, socket_for_server).await
+    });
 
     for _ in 0..100 {
         if socket.exists() {
