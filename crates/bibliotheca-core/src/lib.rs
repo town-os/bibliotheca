@@ -9,6 +9,7 @@
 
 pub mod acl;
 pub mod backend;
+pub mod data;
 pub mod error;
 pub mod identity;
 pub mod password;
