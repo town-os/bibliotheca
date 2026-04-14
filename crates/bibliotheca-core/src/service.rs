@@ -188,6 +188,54 @@ impl BibliothecaService {
         self.store.get_subvolume(id)
     }
 
+    /// Adopt an externally-provisioned subvolume (for example one
+    /// created by the town-os systemcontroller). Unlike
+    /// [`Self::create_subvolume`], this does **not** touch the
+    /// [`SubvolumeBackend`] — the caller promises the btrfs (or
+    /// equivalent) subvolume already exists at `mount_path`. Used
+    /// exclusively by the sync subsystem when procuring storage
+    /// through town-os.
+    pub fn adopt_subvolume(
+        &self,
+        name: &str,
+        owner: UserId,
+        mount_path: std::path::PathBuf,
+        quota_bytes: u64,
+        acl: Option<Acl>,
+    ) -> Result<Subvolume> {
+        if name.trim().is_empty() || name.contains('/') {
+            return Err(Error::InvalidArgument("invalid subvolume name".into()));
+        }
+        let _ = self.store.get_user_by_id(owner)?;
+        let acl = acl.unwrap_or_else(|| Acl::owner_only(owner));
+        let sv = self
+            .store
+            .create_subvolume(name, owner, mount_path, quota_bytes, &acl)?;
+        info!(subvolume = %sv.id, name, "adopted external subvolume");
+        Ok(sv)
+    }
+
+    /// Drop the metadata row for a subvolume without calling the
+    /// backend. Used when the underlying storage is owned by an
+    /// external system (e.g. town-os) that will reclaim it
+    /// separately.
+    pub fn forget_subvolume(&self, id: SubvolumeId) -> Result<()> {
+        let snaps = self.store.list_snapshots(id)?;
+        for snap in snaps {
+            let _ = self.store.delete_snapshot(snap.id);
+        }
+        self.store.delete_subvolume(id)?;
+        Ok(())
+    }
+
+    /// Update the quota row without calling the backend. Used when
+    /// the real quota is enforced elsewhere (town-os) but we still
+    /// want [`DataStore::put`] to honour the limit locally.
+    pub fn update_subvolume_quota(&self, id: SubvolumeId, quota_bytes: u64) -> Result<Subvolume> {
+        self.store.set_quota(id, quota_bytes)?;
+        self.store.get_subvolume(id)
+    }
+
     pub fn set_acl(&self, id: SubvolumeId, acl: &Acl) -> Result<Subvolume> {
         self.store.set_acl(id, acl)?;
         self.store.get_subvolume(id)

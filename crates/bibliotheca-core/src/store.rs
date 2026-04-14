@@ -60,6 +60,77 @@ CREATE TABLE IF NOT EXISTS snapshots (
     created_at   INTEGER NOT NULL,
     UNIQUE (subvolume_id, name)
 );
+
+CREATE TABLE IF NOT EXISTS kv_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sync_credentials (
+    id          TEXT PRIMARY KEY,
+    kind        TEXT NOT NULL,
+    nonce       BLOB NOT NULL,
+    ciphertext  BLOB NOT NULL,
+    created_at  INTEGER NOT NULL,
+    rotated_at  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sync_mounts (
+    id              TEXT PRIMARY KEY,
+    name            TEXT NOT NULL UNIQUE,
+    kind            TEXT NOT NULL,
+    subvolume_id    TEXT NOT NULL UNIQUE
+                    REFERENCES subvolumes(id) ON DELETE CASCADE,
+    townos_name     TEXT NOT NULL,
+    direction       TEXT NOT NULL,
+    interval_secs   INTEGER NOT NULL DEFAULT 300,
+    enabled         INTEGER NOT NULL DEFAULT 1,
+    paused          INTEGER NOT NULL DEFAULT 0,
+    quota_bytes     INTEGER NOT NULL DEFAULT 0,
+    cursor_blob     BLOB,
+    config_json     TEXT NOT NULL DEFAULT '{}',
+    credentials_id  TEXT REFERENCES sync_credentials(id) ON DELETE SET NULL,
+    last_sync_at    INTEGER,
+    last_error      TEXT,
+    backoff_until   INTEGER,
+    created_at      INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS sync_mounts_enabled_idx
+    ON sync_mounts(enabled, paused);
+
+CREATE TABLE IF NOT EXISTS sync_objects (
+    mount_id       TEXT NOT NULL
+                   REFERENCES sync_mounts(id) ON DELETE CASCADE,
+    remote_id      TEXT NOT NULL,
+    key            TEXT NOT NULL,
+    size           INTEGER NOT NULL,
+    etag           TEXT,
+    remote_mtime   INTEGER NOT NULL,
+    local_mtime    INTEGER NOT NULL,
+    local_hash     TEXT,
+    remote_hash    TEXT,
+    last_action    TEXT NOT NULL,
+    last_synced_at INTEGER NOT NULL,
+    PRIMARY KEY (mount_id, remote_id)
+);
+
+CREATE INDEX IF NOT EXISTS sync_objects_key_idx
+    ON sync_objects(mount_id, key);
+
+CREATE TABLE IF NOT EXISTS sync_events (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    mount_id     TEXT NOT NULL
+                 REFERENCES sync_mounts(id) ON DELETE CASCADE,
+    ts           INTEGER NOT NULL,
+    level        TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    message      TEXT NOT NULL,
+    details_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS sync_events_mount_ts_idx
+    ON sync_events(mount_id, ts DESC);
 "#;
 
 #[derive(Clone)]
@@ -538,6 +609,379 @@ impl Store {
         Ok(snap)
     }
 
+    // ------- sync DAOs -------
+    //
+    // These are thin, string-typed row accessors. The sync-core crate
+    // wraps them with strongly-typed enums and ergonomic builders;
+    // keeping the raw surface in `Store` avoids a circular dependency
+    // (sync-core would otherwise need to reach into bibliotheca-core
+    // for the sqlite handle).
+
+    pub fn insert_sync_credentials(
+        &self,
+        kind: &str,
+        nonce: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let conn = self.inner.lock();
+        conn.execute(
+            "INSERT INTO sync_credentials (id, kind, nonce, ciphertext, created_at, rotated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+            params![id, kind, nonce, ciphertext, now],
+        )?;
+        Ok(id)
+    }
+
+    pub fn get_sync_credentials(&self, id: &str) -> Result<SyncCredentialsRow> {
+        let conn = self.inner.lock();
+        let row = conn
+            .query_row(
+                "SELECT id, kind, nonce, ciphertext FROM sync_credentials WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok(SyncCredentialsRow {
+                        id: r.get::<_, String>(0)?,
+                        kind: r.get::<_, String>(1)?,
+                        nonce: r.get::<_, Vec<u8>>(2)?,
+                        ciphertext: r.get::<_, Vec<u8>>(3)?,
+                    })
+                },
+            )
+            .optional()?;
+        row.ok_or_else(|| Error::NotFound(format!("sync credentials {id}")))
+    }
+
+    pub fn rotate_sync_credentials(&self, id: &str, nonce: &[u8], ciphertext: &[u8]) -> Result<()> {
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let conn = self.inner.lock();
+        let n = conn.execute(
+            "UPDATE sync_credentials SET nonce = ?1, ciphertext = ?2, rotated_at = ?3 WHERE id = ?4",
+            params![nonce, ciphertext, now, id],
+        )?;
+        if n == 0 {
+            return Err(Error::NotFound(format!("sync credentials {id}")));
+        }
+        Ok(())
+    }
+
+    pub fn list_sync_credentials(&self) -> Result<Vec<SyncCredentialsRow>> {
+        let conn = self.inner.lock();
+        let mut stmt =
+            conn.prepare("SELECT id, kind, nonce, ciphertext FROM sync_credentials ORDER BY id")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(SyncCredentialsRow {
+                    id: r.get::<_, String>(0)?,
+                    kind: r.get::<_, String>(1)?,
+                    nonce: r.get::<_, Vec<u8>>(2)?,
+                    ciphertext: r.get::<_, Vec<u8>>(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn delete_sync_credentials(&self, id: &str) -> Result<()> {
+        let conn = self.inner.lock();
+        conn.execute("DELETE FROM sync_credentials WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn insert_sync_mount(&self, row: &SyncMountRow) -> Result<()> {
+        let conn = self.inner.lock();
+        conn.execute(
+            "INSERT INTO sync_mounts
+              (id, name, kind, subvolume_id, townos_name, direction,
+               interval_secs, enabled, paused, quota_bytes, cursor_blob,
+               config_json, credentials_id, last_sync_at, last_error,
+               backoff_until, created_at)
+             VALUES
+              (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+               ?14, ?15, ?16, ?17)",
+            params![
+                row.id,
+                row.name,
+                row.kind,
+                row.subvolume_id,
+                row.townos_name,
+                row.direction,
+                row.interval_secs as i64,
+                i64::from(row.enabled),
+                i64::from(row.paused),
+                row.quota_bytes as i64,
+                row.cursor_blob,
+                row.config_json,
+                row.credentials_id,
+                row.last_sync_at,
+                row.last_error,
+                row.backoff_until,
+                row.created_at,
+            ],
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::SqliteFailure(ref f, _)
+                if f.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                Error::AlreadyExists(format!("sync mount {}", row.name))
+            }
+            other => other.into(),
+        })?;
+        Ok(())
+    }
+
+    pub fn get_sync_mount(&self, id: &str) -> Result<SyncMountRow> {
+        let conn = self.inner.lock();
+        let row = conn
+            .query_row(SYNC_MOUNT_SELECT_BY_ID, params![id], sync_mount_row_from)
+            .optional()?;
+        row.ok_or_else(|| Error::NotFound(format!("sync mount {id}")))
+    }
+
+    pub fn get_sync_mount_by_name(&self, name: &str) -> Result<SyncMountRow> {
+        let conn = self.inner.lock();
+        let row = conn
+            .query_row(
+                SYNC_MOUNT_SELECT_BY_NAME,
+                params![name],
+                sync_mount_row_from,
+            )
+            .optional()?;
+        row.ok_or_else(|| Error::NotFound(format!("sync mount {name}")))
+    }
+
+    pub fn list_sync_mounts(&self) -> Result<Vec<SyncMountRow>> {
+        let conn = self.inner.lock();
+        let mut stmt = conn.prepare(SYNC_MOUNT_SELECT_ALL)?;
+        let rows = stmt
+            .query_map([], sync_mount_row_from)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn update_sync_mount_cursor(&self, id: &str, cursor: Option<&[u8]>) -> Result<()> {
+        let conn = self.inner.lock();
+        let n = conn.execute(
+            "UPDATE sync_mounts SET cursor_blob = ?1 WHERE id = ?2",
+            params![cursor, id],
+        )?;
+        if n == 0 {
+            return Err(Error::NotFound(format!("sync mount {id}")));
+        }
+        Ok(())
+    }
+
+    pub fn update_sync_mount_status(
+        &self,
+        id: &str,
+        last_sync_at: Option<i64>,
+        last_error: Option<&str>,
+        backoff_until: Option<i64>,
+    ) -> Result<()> {
+        let conn = self.inner.lock();
+        let n = conn.execute(
+            "UPDATE sync_mounts SET last_sync_at = COALESCE(?1, last_sync_at),
+                                     last_error = ?2,
+                                     backoff_until = ?3
+              WHERE id = ?4",
+            params![last_sync_at, last_error, backoff_until, id],
+        )?;
+        if n == 0 {
+            return Err(Error::NotFound(format!("sync mount {id}")));
+        }
+        Ok(())
+    }
+
+    pub fn update_sync_mount_quota(&self, id: &str, quota_bytes: u64) -> Result<()> {
+        let conn = self.inner.lock();
+        let n = conn.execute(
+            "UPDATE sync_mounts SET quota_bytes = ?1 WHERE id = ?2",
+            params![quota_bytes as i64, id],
+        )?;
+        if n == 0 {
+            return Err(Error::NotFound(format!("sync mount {id}")));
+        }
+        Ok(())
+    }
+
+    pub fn set_sync_mount_paused(&self, id: &str, paused: bool) -> Result<()> {
+        let conn = self.inner.lock();
+        let n = conn.execute(
+            "UPDATE sync_mounts SET paused = ?1 WHERE id = ?2",
+            params![i64::from(paused), id],
+        )?;
+        if n == 0 {
+            return Err(Error::NotFound(format!("sync mount {id}")));
+        }
+        Ok(())
+    }
+
+    pub fn update_sync_mount_config(&self, id: &str, config_json: &str) -> Result<()> {
+        let conn = self.inner.lock();
+        let n = conn.execute(
+            "UPDATE sync_mounts SET config_json = ?1 WHERE id = ?2",
+            params![config_json, id],
+        )?;
+        if n == 0 {
+            return Err(Error::NotFound(format!("sync mount {id}")));
+        }
+        Ok(())
+    }
+
+    pub fn update_sync_mount_interval(&self, id: &str, interval_secs: u32) -> Result<()> {
+        let conn = self.inner.lock();
+        let n = conn.execute(
+            "UPDATE sync_mounts SET interval_secs = ?1 WHERE id = ?2",
+            params![interval_secs as i64, id],
+        )?;
+        if n == 0 {
+            return Err(Error::NotFound(format!("sync mount {id}")));
+        }
+        Ok(())
+    }
+
+    pub fn update_sync_mount_direction(&self, id: &str, direction: &str) -> Result<()> {
+        let conn = self.inner.lock();
+        let n = conn.execute(
+            "UPDATE sync_mounts SET direction = ?1 WHERE id = ?2",
+            params![direction, id],
+        )?;
+        if n == 0 {
+            return Err(Error::NotFound(format!("sync mount {id}")));
+        }
+        Ok(())
+    }
+
+    pub fn delete_sync_mount(&self, id: &str) -> Result<()> {
+        let conn = self.inner.lock();
+        let n = conn.execute("DELETE FROM sync_mounts WHERE id = ?1", params![id])?;
+        if n == 0 {
+            return Err(Error::NotFound(format!("sync mount {id}")));
+        }
+        Ok(())
+    }
+
+    pub fn upsert_sync_object(&self, row: &SyncObjectRow) -> Result<()> {
+        let conn = self.inner.lock();
+        conn.execute(
+            "INSERT INTO sync_objects
+              (mount_id, remote_id, key, size, etag, remote_mtime, local_mtime,
+               local_hash, remote_hash, last_action, last_synced_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(mount_id, remote_id) DO UPDATE SET
+                key = excluded.key,
+                size = excluded.size,
+                etag = excluded.etag,
+                remote_mtime = excluded.remote_mtime,
+                local_mtime = excluded.local_mtime,
+                local_hash = excluded.local_hash,
+                remote_hash = excluded.remote_hash,
+                last_action = excluded.last_action,
+                last_synced_at = excluded.last_synced_at",
+            params![
+                row.mount_id,
+                row.remote_id,
+                row.key,
+                row.size as i64,
+                row.etag,
+                row.remote_mtime,
+                row.local_mtime,
+                row.local_hash,
+                row.remote_hash,
+                row.last_action,
+                row.last_synced_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_sync_objects(&self, mount_id: &str) -> Result<Vec<SyncObjectRow>> {
+        let conn = self.inner.lock();
+        let mut stmt = conn.prepare(SYNC_OBJECT_SELECT_ALL)?;
+        let rows = stmt
+            .query_map(params![mount_id], sync_object_row_from)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn delete_sync_object(&self, mount_id: &str, remote_id: &str) -> Result<()> {
+        let conn = self.inner.lock();
+        conn.execute(
+            "DELETE FROM sync_objects WHERE mount_id = ?1 AND remote_id = ?2",
+            params![mount_id, remote_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_sync_event(&self, ev: &SyncEventRow) -> Result<i64> {
+        let conn = self.inner.lock();
+        conn.execute(
+            "INSERT INTO sync_events (mount_id, ts, level, kind, message, details_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                ev.mount_id,
+                ev.ts,
+                ev.level,
+                ev.kind,
+                ev.message,
+                ev.details_json,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn recent_sync_events(
+        &self,
+        mount_id: &str,
+        since_ts: i64,
+        limit: u32,
+    ) -> Result<Vec<SyncEventRow>> {
+        let conn = self.inner.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, mount_id, ts, level, kind, message, details_json
+               FROM sync_events
+              WHERE mount_id = ?1 AND ts >= ?2
+              ORDER BY ts ASC, id ASC
+              LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(params![mount_id, since_ts, limit as i64], |r| {
+                Ok(SyncEventRow {
+                    id: r.get::<_, i64>(0)?,
+                    mount_id: r.get::<_, String>(1)?,
+                    ts: r.get::<_, i64>(2)?,
+                    level: r.get::<_, String>(3)?,
+                    kind: r.get::<_, String>(4)?,
+                    message: r.get::<_, String>(5)?,
+                    details_json: r.get::<_, String>(6)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn kv_get(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.inner.lock();
+        Ok(conn
+            .query_row(
+                "SELECT value FROM kv_meta WHERE key = ?1",
+                params![key],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?)
+    }
+
+    pub fn kv_set(&self, key: &str, value: &str) -> Result<()> {
+        let conn = self.inner.lock();
+        conn.execute(
+            "INSERT INTO kv_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
     /// Helper used by ACL evaluation in the data-plane: resolves a
     /// (subvolume, user) pair into the boolean check result.
     pub fn check_permission(
@@ -629,6 +1073,130 @@ fn parse_uuid(s: &str) -> rusqlite::Result<Uuid> {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
     })
 }
+
+// ---------- sync DAO row types ----------
+
+#[derive(Debug, Clone)]
+pub struct SyncCredentialsRow {
+    pub id: String,
+    pub kind: String,
+    pub nonce: Vec<u8>,
+    pub ciphertext: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SyncMountRow {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub subvolume_id: String,
+    pub townos_name: String,
+    pub direction: String,
+    pub interval_secs: u32,
+    pub enabled: bool,
+    pub paused: bool,
+    pub quota_bytes: u64,
+    pub cursor_blob: Option<Vec<u8>>,
+    pub config_json: String,
+    pub credentials_id: Option<String>,
+    pub last_sync_at: Option<i64>,
+    pub last_error: Option<String>,
+    pub backoff_until: Option<i64>,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SyncObjectRow {
+    pub mount_id: String,
+    pub remote_id: String,
+    pub key: String,
+    pub size: u64,
+    pub etag: Option<String>,
+    pub remote_mtime: i64,
+    pub local_mtime: i64,
+    pub local_hash: Option<String>,
+    pub remote_hash: Option<String>,
+    pub last_action: String,
+    pub last_synced_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SyncEventRow {
+    pub id: i64,
+    pub mount_id: String,
+    pub ts: i64,
+    pub level: String,
+    pub kind: String,
+    pub message: String,
+    pub details_json: String,
+}
+
+const SYNC_MOUNT_COLS: &str = "id, name, kind, subvolume_id, townos_name, direction,
+    interval_secs, enabled, paused, quota_bytes, cursor_blob, config_json,
+    credentials_id, last_sync_at, last_error, backoff_until, created_at";
+
+const SYNC_MOUNT_SELECT_BY_ID: &str = "SELECT id, name, kind, subvolume_id, townos_name, direction,
+    interval_secs, enabled, paused, quota_bytes, cursor_blob, config_json,
+    credentials_id, last_sync_at, last_error, backoff_until, created_at
+    FROM sync_mounts WHERE id = ?1";
+
+const SYNC_MOUNT_SELECT_BY_NAME: &str =
+    "SELECT id, name, kind, subvolume_id, townos_name, direction,
+    interval_secs, enabled, paused, quota_bytes, cursor_blob, config_json,
+    credentials_id, last_sync_at, last_error, backoff_until, created_at
+    FROM sync_mounts WHERE name = ?1";
+
+const SYNC_MOUNT_SELECT_ALL: &str = "SELECT id, name, kind, subvolume_id, townos_name, direction,
+    interval_secs, enabled, paused, quota_bytes, cursor_blob, config_json,
+    credentials_id, last_sync_at, last_error, backoff_until, created_at
+    FROM sync_mounts ORDER BY name";
+
+const SYNC_OBJECT_SELECT_ALL: &str = "SELECT mount_id, remote_id, key, size, etag,
+    remote_mtime, local_mtime, local_hash, remote_hash, last_action, last_synced_at
+    FROM sync_objects WHERE mount_id = ?1 ORDER BY key";
+
+fn sync_mount_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<SyncMountRow> {
+    Ok(SyncMountRow {
+        id: r.get::<_, String>(0)?,
+        name: r.get::<_, String>(1)?,
+        kind: r.get::<_, String>(2)?,
+        subvolume_id: r.get::<_, String>(3)?,
+        townos_name: r.get::<_, String>(4)?,
+        direction: r.get::<_, String>(5)?,
+        interval_secs: r.get::<_, i64>(6)?.max(0) as u32,
+        enabled: r.get::<_, i64>(7)? != 0,
+        paused: r.get::<_, i64>(8)? != 0,
+        quota_bytes: r.get::<_, i64>(9)?.max(0) as u64,
+        cursor_blob: r.get::<_, Option<Vec<u8>>>(10)?,
+        config_json: r.get::<_, String>(11)?,
+        credentials_id: r.get::<_, Option<String>>(12)?,
+        last_sync_at: r.get::<_, Option<i64>>(13)?,
+        last_error: r.get::<_, Option<String>>(14)?,
+        backoff_until: r.get::<_, Option<i64>>(15)?,
+        created_at: r.get::<_, i64>(16)?,
+    })
+}
+
+fn sync_object_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<SyncObjectRow> {
+    Ok(SyncObjectRow {
+        mount_id: r.get::<_, String>(0)?,
+        remote_id: r.get::<_, String>(1)?,
+        key: r.get::<_, String>(2)?,
+        size: r.get::<_, i64>(3)?.max(0) as u64,
+        etag: r.get::<_, Option<String>>(4)?,
+        remote_mtime: r.get::<_, i64>(5)?,
+        local_mtime: r.get::<_, i64>(6)?,
+        local_hash: r.get::<_, Option<String>>(7)?,
+        remote_hash: r.get::<_, Option<String>>(8)?,
+        last_action: r.get::<_, String>(9)?,
+        last_synced_at: r.get::<_, i64>(10)?,
+    })
+}
+
+// silence dead_code on SYNC_MOUNT_COLS (we keep it as documentation
+// of the column ordering, referenced by the row parser above).
+#[allow(dead_code)]
+const _SYNC_MOUNT_COLS_USED: &str = SYNC_MOUNT_COLS;
 
 #[cfg(test)]
 mod tests {
