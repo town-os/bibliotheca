@@ -1004,4 +1004,53 @@ impl AnisetteAdmin for AnisetteAdminSvc {
         provider.reset();
         Ok(Response::new(()))
     }
+
+    async fn add_peer(
+        &self,
+        req: Request<pb::AnisettePeerRequest>,
+    ) -> Result<Response<()>, Status> {
+        let Some((provider, _)) = &self.provider else {
+            return Err(Status::unavailable("anisette proxy disabled"));
+        };
+        let url = req.into_inner().url;
+        provider.add_upstream(&url).map_err(anisette_err)?;
+        info!(peer = %url, "anisette peer added");
+        Ok(Response::new(()))
+    }
+
+    async fn remove_peer(
+        &self,
+        req: Request<pb::AnisettePeerRequest>,
+    ) -> Result<Response<()>, Status> {
+        let Some((provider, _)) = &self.provider else {
+            return Err(Status::unavailable("anisette proxy disabled"));
+        };
+        let url = req.into_inner().url;
+        provider.remove_upstream(&url).map_err(anisette_err)?;
+        info!(peer = %url, "anisette peer removed");
+        Ok(Response::new(()))
+    }
+
+    async fn list_peers(
+        &self,
+        _req: Request<()>,
+    ) -> Result<Response<pb::ListPeersResponse>, Status> {
+        let Some((provider, _)) = &self.provider else {
+            return Ok(Response::new(pb::ListPeersResponse { urls: vec![] }));
+        };
+        Ok(Response::new(pb::ListPeersResponse {
+            urls: provider.upstreams(),
+        }))
+    }
+}
+
+fn anisette_err(e: bibliotheca_anisette::Error) -> Status {
+    use bibliotheca_anisette::Error as E;
+    match e {
+        E::NotSupported(m) => Status::unimplemented(m),
+        E::AlreadyExists(m) => Status::already_exists(m),
+        E::NotFound(m) => Status::not_found(m),
+        E::InvalidUrl(m) => Status::invalid_argument(m),
+        other => Status::internal(other.to_string()),
+    }
 }

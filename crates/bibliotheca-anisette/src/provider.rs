@@ -59,6 +59,31 @@ pub trait AnisetteProvider: Send + Sync + 'static {
     async fn get(&self) -> Result<AnisetteHeaders>;
     fn status(&self) -> ProviderStatus;
     fn reset(&self);
+
+    /// Add a peer URL to the upstream pool at runtime. Providers
+    /// that don't manage a peer list (e.g. `MockProvider`) return
+    /// `Error::NotSupported`. Adding a URL already in the pool
+    /// returns `Error::AlreadyExists`.
+    fn add_upstream(&self, _url: &str) -> Result<()> {
+        Err(crate::error::Error::NotSupported(
+            "provider does not manage a dynamic upstream pool".into(),
+        ))
+    }
+
+    /// Remove a peer URL from the upstream pool. Returns
+    /// `Error::NotFound` if the URL wasn't there; providers that
+    /// don't manage a pool return `Error::NotSupported`.
+    fn remove_upstream(&self, _url: &str) -> Result<()> {
+        Err(crate::error::Error::NotSupported(
+            "provider does not manage a dynamic upstream pool".into(),
+        ))
+    }
+
+    /// Current upstream URLs. Empty for providers that don't
+    /// manage a pool.
+    fn upstreams(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// Test-only provider. Returns deterministic headers and counts

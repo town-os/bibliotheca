@@ -68,6 +68,12 @@ enum AnisetteCmd {
     /// Clear the cached OTP and upstream backoff state so the next
     /// request hits upstream fresh.
     Reset,
+    /// Register a new upstream anisette peer at runtime.
+    AddPeer { url: String },
+    /// Remove a previously-added upstream.
+    RemovePeer { url: String },
+    /// Print the current list of upstream URLs.
+    ListPeers,
 }
 
 #[derive(Debug, Subcommand)]
@@ -341,6 +347,18 @@ async fn main() -> anyhow::Result<()> {
                 }
                 AnisetteCmd::Reset => {
                     client.reset(()).await?;
+                }
+                AnisetteCmd::AddPeer { url } => {
+                    client.add_peer(pb::AnisettePeerRequest { url }).await?;
+                }
+                AnisetteCmd::RemovePeer { url } => {
+                    client.remove_peer(pb::AnisettePeerRequest { url }).await?;
+                }
+                AnisetteCmd::ListPeers => {
+                    let resp = client.list_peers(()).await?.into_inner();
+                    for u in resp.urls {
+                        println!("{u}");
+                    }
                 }
             }
         }

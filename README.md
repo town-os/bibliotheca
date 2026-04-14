@@ -25,6 +25,15 @@ bibliotheca/
     ├── bibliotheca-icloud      # iCloud / CloudKit Web Services
     ├── bibliotheca-photos      # Google Photos Library API
     ├── bibliotheca-admin       # HTML admin panel (indexed browsing)
+    ├── bibliotheca-sync-core   # client-side connector trait, supervisor, state,
+    │                           #   conflict resolver, town-os storage procurement
+    ├── bibliotheca-sync-ipfs       # IPFS sync connector
+    ├── bibliotheca-sync-dropbox    # Dropbox sync connector
+    ├── bibliotheca-sync-nextcloud  # Nextcloud / WebDAV sync connector
+    ├── bibliotheca-sync-solid      # Solid / LDP sync connector
+    ├── bibliotheca-sync-gphotos    # Google Photos sync connector
+    ├── bibliotheca-sync-icloud     # iCloud Photos sync connector (pyicloud port)
+    ├── bibliotheca-anisette    # client-side anisette proxy for sync-icloud
     ├── bibliothecad            # the daemon binary
     └── bibliothecactl          # admin CLI talking to the daemon socket
 ```
@@ -119,6 +128,82 @@ helper and the `bibliotheca.v1.Ipfs` gRPC service. Bytes are materialized
 into the target subvolume by way of the same ACL / mount-path machinery
 the other interfaces use, so an IPFS export respects per-subvolume
 quotas exactly the way an HTTP PUT does.
+
+### Sync connectors
+
+Every server-side transport has a client-side twin. A `sync-*` crate
+takes a remote service and mirrors its contents into a local
+subvolume, which every existing transport can then re-serve. Mounts
+are created via the control plane (`SyncAdmin.CreateMount`) and
+managed at runtime with `bibliothecactl sync mount …`. Each mount
+owns exactly one subvolume, procured on demand through the town-os
+systemcontroller (`POST /storage/create`) so storage allocation
+goes through the same path as the rest of town-os. Quotas are a
+first-class, editable field: set at create time, updatable via
+`bibliothecactl sync mount set-quota`, enforced by `DataStore::put`,
+resized on the town-os side via `POST /storage/modify`.
+
+Six connector kinds ship today: `ipfs`, `dropbox`, `nextcloud`
+(WebDAV), `solid`, `gphotos`, `icloud`. Each has its own
+encryption-at-rest credential blob in `sync_credentials` (AES-GCM-256
+with a master key from `BIBLIOTHECA_SECRET_KEY` or
+`--sync-secret-key-file`), its own incremental cursor in
+`sync_mounts.cursor_blob`, and its own integration test against a
+mock server. Direction can be `pull`, `push`, or `both`; bidirectional
+mounts stash conflict losers to `.conflicts/<unix_ts>/<key>` inside
+the subvolume and emit a `conflict` event over the supervisor's
+`SyncAdmin.TailEvents` stream.
+
+### Anisette proxy
+
+`sync-icloud` needs Apple's device attestation headers on every
+`idmsa.apple.com` request. Those headers are produced by Apple's
+`CoreADI` library, which only runs on Apple hardware, so the actual
+producer must live somewhere the operator owns.
+
+`bibliotheca-anisette` is a **client-side proxy** that forwards
+`POST /v3/get_anisette_data` to one or more operator-controlled
+upstream producers — typically a peer bibliotheca node reachable
+over a VPN and resolved via private DNS. It never forwards to
+community or third-party providers. Features on top of a single
+upstream:
+
+- round-robin failover across multiple peers
+- per-upstream health tracking with exponential backoff
+- short-TTL response caching (Apple's OTPs are valid for ~30 s)
+- dynamic peer management via gRPC (`AnisetteAdmin.AddPeer`,
+  `RemovePeer`, `ListPeers`) and
+  `bibliothecactl anisette {add-peer,remove-peer,list-peers}`
+- optional mDNS/Bonjour discovery of peers advertising
+  `_bibliotheca-anisette._tcp.local.` (build with the `mdns`
+  feature on `bibliothecad`)
+
+The proxy is off by default. Enable it by passing at least one
+upstream URL or the mDNS flag on the daemon command line:
+
+```sh
+bibliothecad \
+  --anisette-listen 127.0.0.1:6969 \
+  --anisette-upstream https://anisette.iphone.tailnet.ts.net \
+  --anisette-upstream https://anisette.mac-mini.tailnet.ts.net \
+  --anisette-cache-ttl-secs 20
+```
+
+With the proxy up, `sync-icloud` mounts set their credential
+blob's `anisette_url` to `http://127.0.0.1:6969` and never see the
+upstream directly.
+
+#### Peer options
+
+What actually *produces* anisette data is out of scope for
+`bibliotheca-anisette` — the operator runs one or more producer
+nodes inside their trust boundary. A realistic option we may ship
+later: an iPhone app that wraps the native `AOSKit.framework`
+anisette APIs and serves them over HTTP on a Bonjour-advertised
+local socket, so the phone itself becomes a first-class peer.
+Wiring is already in place today: the iPhone (or anything else)
+just needs to speak the `POST /v3/get_anisette_data` shape, and
+the proxy will discover it via mDNS or accept it via `add-peer`.
 
 ## Build
 

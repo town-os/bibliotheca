@@ -135,6 +135,12 @@ struct Args {
     /// Backoff (seconds) for a failed anisette upstream.
     #[arg(long, default_value_t = 60)]
     anisette_backoff_secs: u64,
+
+    /// Enable mDNS/Bonjour discovery of peer anisette servers on
+    /// the local network. Requires the daemon to be built with
+    /// the `mdns` feature; without it, the flag is a no-op.
+    #[arg(long, default_value_t = false)]
+    anisette_mdns: bool,
 }
 
 #[tokio::main]
@@ -179,7 +185,7 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    let anisette_cfg = if args.anisette_upstreams.is_empty() {
+    let anisette_cfg = if args.anisette_upstreams.is_empty() && !args.anisette_mdns {
         None
     } else {
         Some(AnisetteBootConfig {
@@ -188,6 +194,7 @@ async fn main() -> anyhow::Result<()> {
             cache_ttl_secs: args.anisette_cache_ttl_secs,
             request_timeout_secs: args.anisette_request_timeout_secs,
             backoff_secs: args.anisette_backoff_secs,
+            mdns_enabled: args.anisette_mdns,
         })
     };
     let anisette_provider = anisette::boot(anisette_cfg, shutdown.clone());

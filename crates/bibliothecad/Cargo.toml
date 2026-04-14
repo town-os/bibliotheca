@@ -51,6 +51,14 @@ time.workspace = true
 futures.workspace = true
 async-stream.workspace = true
 url.workspace = true
+mdns-sd = { workspace = true, optional = true }
+
+[features]
+default = []
+# Auto-discover peer anisette servers on the local network via
+# `_bibliotheca-anisette._tcp.local.` mDNS advertisements. Pulls
+# in the `mdns-sd` crate.
+mdns = ["dep:mdns-sd"]
 
 [dev-dependencies]
 bibliotheca-core = { workspace = true, features = ["test-support"] }

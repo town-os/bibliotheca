@@ -254,4 +254,47 @@ impl AnisetteProvider for ProxyProvider {
             u.last_error = None;
         }
     }
+
+    fn add_upstream(&self, url: &str) -> Result<()> {
+        let parsed = Url::parse(url).map_err(|e| Error::InvalidUrl(e.to_string()))?;
+        let canonical = parsed.to_string();
+        let mut g = self.state.lock();
+        if g.upstreams.iter().any(|u| u.url == canonical) {
+            return Err(Error::AlreadyExists(canonical));
+        }
+        g.upstreams.push(UpstreamState {
+            url: canonical,
+            ok: 0,
+            err: 0,
+            last_error: None,
+            unhealthy_until: None,
+        });
+        Ok(())
+    }
+
+    fn remove_upstream(&self, url: &str) -> Result<()> {
+        let canonical = Url::parse(url)
+            .map(|u| u.to_string())
+            .unwrap_or_else(|_| url.to_string());
+        let mut g = self.state.lock();
+        let before = g.upstreams.len();
+        g.upstreams.retain(|u| u.url != canonical);
+        if g.upstreams.len() == before {
+            return Err(Error::NotFound(canonical));
+        }
+        // Reset the round-robin pointer if we've outrun the tail.
+        if g.next_upstream >= g.upstreams.len() {
+            g.next_upstream = 0;
+        }
+        Ok(())
+    }
+
+    fn upstreams(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .upstreams
+            .iter()
+            .map(|u| u.url.clone())
+            .collect()
+    }
 }

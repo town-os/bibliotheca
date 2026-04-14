@@ -267,3 +267,82 @@ async fn empty_upstream_list_rejected_at_construction() {
     let err = ProxyProvider::new(ProxyConfig::default()).err().unwrap();
     assert!(matches!(err, bibliotheca_anisette::Error::NoUpstreams));
 }
+
+#[tokio::test]
+async fn dynamic_add_upstream_enables_fetches() {
+    let (upstream_addr, upstream) = spawn_upstream().await;
+    let (bootstrap_addr, _) = spawn_upstream().await;
+    let proxy = ProxyProvider::new(ProxyConfig {
+        upstreams: vec![Url::parse(&format!("http://{bootstrap_addr}")).unwrap()],
+        cache_ttl_secs: 0,
+        request_timeout_secs: 5,
+        backoff_secs: 1,
+    })
+    .unwrap();
+    // Remove the bootstrap upstream and add the real one at runtime.
+    proxy
+        .remove_upstream(&format!("http://{bootstrap_addr}/"))
+        .unwrap();
+    proxy
+        .add_upstream(&format!("http://{upstream_addr}/"))
+        .unwrap();
+    assert_eq!(proxy.upstreams().len(), 1);
+
+    let headers = proxy.get().await.unwrap();
+    assert_eq!(headers.md, "md-1");
+    assert_eq!(*upstream.calls.lock(), 1);
+}
+
+#[tokio::test]
+async fn add_upstream_is_idempotent_on_duplicate() {
+    let (addr, _) = spawn_upstream().await;
+    let url = format!("http://{addr}/");
+    let proxy = ProxyProvider::new(ProxyConfig {
+        upstreams: vec![Url::parse(&url).unwrap()],
+        cache_ttl_secs: 0,
+        request_timeout_secs: 5,
+        backoff_secs: 1,
+    })
+    .unwrap();
+    let err = proxy.add_upstream(&url).unwrap_err();
+    assert!(matches!(err, bibliotheca_anisette::Error::AlreadyExists(_)));
+    assert_eq!(proxy.upstreams().len(), 1);
+}
+
+#[tokio::test]
+async fn remove_upstream_missing_returns_not_found() {
+    let (addr, _) = spawn_upstream().await;
+    let proxy = ProxyProvider::new(ProxyConfig {
+        upstreams: vec![Url::parse(&format!("http://{addr}")).unwrap()],
+        cache_ttl_secs: 0,
+        request_timeout_secs: 5,
+        backoff_secs: 1,
+    })
+    .unwrap();
+    let err = proxy.remove_upstream("http://127.0.0.1:1/").unwrap_err();
+    assert!(matches!(err, bibliotheca_anisette::Error::NotFound(_)));
+}
+
+#[tokio::test]
+async fn invalid_upstream_url_rejected() {
+    let (addr, _) = spawn_upstream().await;
+    let proxy = ProxyProvider::new(ProxyConfig {
+        upstreams: vec![Url::parse(&format!("http://{addr}")).unwrap()],
+        cache_ttl_secs: 0,
+        request_timeout_secs: 5,
+        backoff_secs: 1,
+    })
+    .unwrap();
+    let err = proxy.add_upstream("not a url").unwrap_err();
+    assert!(matches!(err, bibliotheca_anisette::Error::InvalidUrl(_)));
+}
+
+#[tokio::test]
+async fn mock_provider_reports_not_supported_for_dynamic_peers() {
+    let mock = MockProvider::new();
+    let err = mock.add_upstream("http://example.com/").unwrap_err();
+    assert!(matches!(err, bibliotheca_anisette::Error::NotSupported(_)));
+    let err = mock.remove_upstream("http://example.com/").unwrap_err();
+    assert!(matches!(err, bibliotheca_anisette::Error::NotSupported(_)));
+    assert!(mock.upstreams().is_empty());
+}

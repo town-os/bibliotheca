@@ -10,6 +10,18 @@ pub enum Error {
     #[error("all upstream anisette servers are unreachable")]
     AllUpstreamsDown,
 
+    #[error("not supported: {0}")]
+    NotSupported(String),
+
+    #[error("upstream already exists: {0}")]
+    AlreadyExists(String),
+
+    #[error("upstream not found: {0}")]
+    NotFound(String),
+
+    #[error("invalid url: {0}")]
+    InvalidUrl(String),
+
     #[error("upstream {upstream} returned http {status}")]
     UpstreamStatus { upstream: String, status: u16 },
 

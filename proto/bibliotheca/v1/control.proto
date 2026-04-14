@@ -375,9 +375,15 @@ message AnisetteUpstreamHealth {
   string last_error = 4;
 }
 
+message AnisettePeerRequest { string url = 1; }
+message ListPeersResponse { repeated string urls = 1; }
+
 service AnisetteAdmin {
   rpc Status(google.protobuf.Empty) returns (AnisetteStatus);
   rpc Reset(google.protobuf.Empty) returns (google.protobuf.Empty);
+  rpc AddPeer(AnisettePeerRequest) returns (google.protobuf.Empty);
+  rpc RemovePeer(AnisettePeerRequest) returns (google.protobuf.Empty);
+  rpc ListPeers(google.protobuf.Empty) returns (ListPeersResponse);
 }
 
 service SyncAdmin {
