@@ -553,31 +553,164 @@ impl WorkerContext {
 
     async fn run_cycle(&self) -> Result<CycleSummary> {
         let mount = self.state.get_mount(self.mount_id)?;
+
+        // Fetch the next page of remote changes. We always call
+        // list_since so we can respond to remote deletes, even in
+        // Push-only mode — a push-only mount still needs to know
+        // when an upload has been reverted server-side so it can
+        // re-push.
         let page = self
             .connector
             .list_since(mount.cursor_blob.as_deref())
             .await?;
 
-        let mut pulled = 0usize;
-        let conflicts = 0usize;
+        let direction = mount.direction;
+        let sv_name = subvolume_name(&mount);
+        let owner = mount_owner(&self.svc, &mount)?;
 
-        // Pull direction in v1: apply everything remote says.
-        for change in page.changes {
+        // Baseline map: what `sync_objects` currently says about
+        // each (remote_id, key) pair. Used to detect local-side
+        // drift when we're in Push or Both modes.
+        let baseline_rows = self.state.list_objects(self.mount_id)?;
+        let mut baseline_by_key: std::collections::HashMap<
+            String,
+            bibliotheca_core::store::SyncObjectRow,
+        > = std::collections::HashMap::new();
+        for row in &baseline_rows {
+            baseline_by_key.insert(row.key.clone(), row.clone());
+        }
+
+        // Current local snapshot for the subvolume. Ignore
+        // .conflicts/ (that's the stash dir we control ourselves).
+        let local_listing = self
+            .data
+            .list_recursive(&sv_name, "", Some(owner), false)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| !m.key.starts_with(".conflicts/"))
+            .collect::<Vec<_>>();
+        let mut local_by_key: std::collections::HashMap<
+            String,
+            bibliotheca_core::data::ObjectMeta,
+        > = std::collections::HashMap::new();
+        for m in local_listing {
+            local_by_key.insert(m.key.clone(), m);
+        }
+
+        let mut pulled = 0usize;
+        let mut pushed = 0usize;
+        let mut conflicts = 0usize;
+
+        // --- PULL / BOTH: remote → local ---
+        let should_pull = matches!(direction, Direction::Pull | Direction::Both);
+        let remote_changes = page.changes.clone();
+        for change in remote_changes {
             match change {
                 crate::trait_::Change::Upsert(obj) => {
-                    self.apply_pull(&mount.name, &mount, &obj).await?;
-                    pulled += 1;
+                    if !should_pull {
+                        continue;
+                    }
+                    let decision = self
+                        .decide_pull(&mount, &obj, &baseline_by_key, &local_by_key)
+                        .await;
+                    match decision {
+                        PullDecision::Skip => {}
+                        PullDecision::TakeRemote => {
+                            self.apply_pull(&mount, &obj).await?;
+                            pulled += 1;
+                        }
+                        PullDecision::StashLocalThenTakeRemote => {
+                            self.stash_local(&mount, &obj.key).await?;
+                            self.apply_pull(&mount, &obj).await?;
+                            pulled += 1;
+                            conflicts += 1;
+                        }
+                    }
                 }
                 crate::trait_::Change::Delete { key, .. } => {
-                    match self.data.delete(
-                        &subvolume_name(&mount),
-                        &key,
-                        Some(mount_owner(&self.svc, &mount)?),
-                        false,
-                    ) {
+                    if !should_pull {
+                        continue;
+                    }
+                    match self.data.delete(&sv_name, &key, Some(owner), false) {
                         Ok(()) | Err(bibliotheca_core::error::Error::NotFound(_)) => {}
                         Err(e) => return Err(Error::from(e)),
                     }
+                    let _ = self.state.delete_object(self.mount_id, &key);
+                }
+            }
+        }
+
+        // --- PUSH / BOTH: local → remote ---
+        let should_push = matches!(direction, Direction::Push | Direction::Both);
+        if should_push {
+            // 1. New / changed locally.
+            for (key, meta) in &local_by_key {
+                let baseline = baseline_by_key.get(key);
+                let local_hash = hash_bytes(
+                    &self
+                        .data
+                        .get(&sv_name, key, Some(owner), false)
+                        .unwrap_or_default(),
+                );
+                let needs_push = match baseline {
+                    None => true, // never seen
+                    Some(row) => row
+                        .local_hash
+                        .as_ref()
+                        .map(|h| h != &local_hash)
+                        .unwrap_or(true),
+                };
+                if !needs_push {
+                    continue;
+                }
+                let bytes = self
+                    .data
+                    .get(&sv_name, key, Some(owner), false)
+                    .map_err(Error::from)?;
+                match self
+                    .connector
+                    .upload(key, &bytes, crate::trait_::UploadHints::default())
+                    .await
+                {
+                    Ok(remote) => {
+                        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+                        let row = bibliotheca_core::store::SyncObjectRow {
+                            mount_id: self.mount_id.to_string(),
+                            remote_id: remote.id.clone(),
+                            key: key.clone(),
+                            size: meta.size,
+                            etag: remote.etag.clone(),
+                            remote_mtime: remote.modified.unix_timestamp(),
+                            local_mtime: meta.modified.unix_timestamp(),
+                            local_hash: Some(local_hash),
+                            remote_hash: remote.etag.clone(),
+                            last_action: "push".into(),
+                            last_synced_at: now,
+                        };
+                        self.state.upsert_object(&row)?;
+                        pushed += 1;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            // 2. Locally deleted — row in baseline but not in local
+            // listing. For `Both` direction we also need to be sure
+            // the remote hasn't been re-uploaded since baseline; we
+            // trust the supervisor's cycle ordering for now and
+            // let the next pull reconcile if it has.
+            for row in &baseline_rows {
+                if !local_by_key.contains_key(&row.key) {
+                    let remote = crate::trait_::RemoteObject {
+                        id: row.remote_id.clone(),
+                        key: row.key.clone(),
+                        size: row.size,
+                        etag: row.etag.clone(),
+                        modified: time::OffsetDateTime::from_unix_timestamp(row.remote_mtime)
+                            .unwrap_or(time::OffsetDateTime::UNIX_EPOCH),
+                        is_dir: false,
+                    };
+                    let _ = self.connector.delete(&remote).await;
+                    let _ = self.state.delete_object(self.mount_id, &row.remote_id);
                 }
             }
         }
@@ -586,20 +719,92 @@ impl WorkerContext {
             .update_cursor(self.mount_id, page.next_cursor.as_deref())?;
         Ok(CycleSummary {
             pulled,
-            pushed: 0,
+            pushed,
             conflicts,
         })
     }
 
-    async fn apply_pull(
+    async fn decide_pull(
         &self,
-        _mount_name: &str,
         mount: &SyncMount,
         obj: &crate::trait_::RemoteObject,
-    ) -> Result<()> {
+        baseline: &std::collections::HashMap<String, bibliotheca_core::store::SyncObjectRow>,
+        local: &std::collections::HashMap<String, bibliotheca_core::data::ObjectMeta>,
+    ) -> PullDecision {
+        if !matches!(mount.direction, Direction::Both) {
+            return PullDecision::TakeRemote;
+        }
+        let sv_name = subvolume_name(mount);
+        let owner = match mount_owner(&self.svc, mount) {
+            Ok(o) => o,
+            Err(_) => return PullDecision::TakeRemote,
+        };
+        let local_meta = match local.get(&obj.key) {
+            Some(m) => m,
+            None => return PullDecision::TakeRemote,
+        };
+        let base = baseline.get(&obj.key);
+
+        // Hash the local bytes to compare against baseline.
+        let local_bytes = match self.data.get(&sv_name, &obj.key, Some(owner), false) {
+            Ok(b) => b,
+            Err(_) => return PullDecision::TakeRemote,
+        };
+        let local_hash = hash_bytes(&local_bytes);
+        let local_changed = match base.and_then(|r| r.local_hash.as_ref()) {
+            Some(h) => h != &local_hash,
+            None => true,
+        };
+        let remote_changed = match base.and_then(|r| r.remote_hash.as_ref()) {
+            Some(h) => Some(h) != obj.etag.as_ref(),
+            None => true,
+        };
+
+        // Identical contents — no-op either way.
+        if let Some(ref remote_etag) = obj.etag {
+            if remote_etag == &local_hash {
+                return PullDecision::Skip;
+            }
+        }
+
+        match (remote_changed, local_changed) {
+            (true, false) => PullDecision::TakeRemote,
+            (false, true) => PullDecision::Skip, // local side wins in the push pass below
+            (false, false) => PullDecision::Skip,
+            (true, true) => {
+                // Both diverged: newer mtime wins. Tie → remote.
+                if obj.modified.unix_timestamp() >= local_meta.modified.unix_timestamp() {
+                    PullDecision::StashLocalThenTakeRemote
+                } else {
+                    PullDecision::Skip
+                }
+            }
+        }
+    }
+
+    async fn stash_local(&self, mount: &SyncMount, key: &str) -> Result<()> {
+        let sv_name = subvolume_name(mount);
+        let owner = mount_owner(&self.svc, mount)?;
+        let bytes = match self.data.get(&sv_name, key, Some(owner), false) {
+            Ok(b) => b,
+            Err(_) => return Ok(()),
+        };
+        let ts = time::OffsetDateTime::now_utc().unix_timestamp();
+        let stash_key = format!(".conflicts/{ts}/{key}");
+        if let Err(e) = self
+            .data
+            .put(&sv_name, &stash_key, Some(owner), false, &bytes)
+        {
+            return Err(Error::from(e));
+        }
+        Ok(())
+    }
+
+    async fn apply_pull(&self, mount: &SyncMount, obj: &crate::trait_::RemoteObject) -> Result<()> {
         let bytes = self.connector.fetch(obj).await?;
         let sv_name = subvolume_name(mount);
         let owner = mount_owner(&self.svc, mount)?;
+        let hash = hash_bytes(&bytes);
         match self
             .data
             .put(&sv_name, &obj.key, Some(owner), false, &bytes)
@@ -613,8 +818,8 @@ impl WorkerContext {
                     etag: obj.etag.clone(),
                     remote_mtime: obj.modified.unix_timestamp(),
                     local_mtime: meta.modified.unix_timestamp(),
-                    local_hash: None,
-                    remote_hash: obj.etag.clone(),
+                    local_hash: Some(hash.clone()),
+                    remote_hash: obj.etag.clone().or(Some(hash)),
                     last_action: "pull".into(),
                     last_synced_at: time::OffsetDateTime::now_utc().unix_timestamp(),
                 };
@@ -652,6 +857,19 @@ struct CycleSummary {
     pulled: usize,
     pushed: usize,
     conflicts: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PullDecision {
+    Skip,
+    TakeRemote,
+    StashLocalThenTakeRemote,
+}
+
+fn hash_bytes(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(bytes);
+    hex::encode(digest)
 }
 
 fn subvolume_name(mount: &SyncMount) -> String {

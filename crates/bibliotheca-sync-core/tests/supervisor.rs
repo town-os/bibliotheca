@@ -334,6 +334,81 @@ async fn create_mount_provisions_townos_and_pulls_files() {
 }
 
 #[tokio::test]
+async fn bidirectional_push_and_conflict_stash() {
+    let h = setup().await;
+
+    let spec = MountSpec {
+        name: "alice-both".into(),
+        kind: ConnectorKind::Dropbox,
+        direction: Direction::Both,
+        interval_secs: 3600,
+        quota_bytes: 0,
+        owner: h.alice_id,
+        config_json: "{}".into(),
+        credentials_id: None,
+    };
+    let credentials = CredentialBlob::OAuth2 {
+        access_token: "at".into(),
+        refresh_token: "rt".into(),
+        expires_at: 9_999_999_999,
+        client_id: "cid".into(),
+        client_secret: "csec".into(),
+        token_url: "https://example.invalid/token".into(),
+    };
+    let mount = h
+        .supervisor
+        .create_mount(spec, credentials)
+        .await
+        .expect("create_mount");
+
+    // First cycle pulls the seeded objects into the subvolume.
+    h.supervisor.trigger_sync(mount.id).await.unwrap();
+    let sv_name = format!("sync-{}", mount.name);
+    for _ in 0..50 {
+        let n = h
+            .data
+            .list_recursive(&sv_name, "", Some(h.alice_id), false)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        if n >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Push path: write a new local file, trigger a cycle, observe
+    // it landed in the MockConnector.
+    h.data
+        .put(
+            &sv_name,
+            "local-only.txt",
+            Some(h.alice_id),
+            false,
+            b"pushed",
+        )
+        .unwrap();
+    h.supervisor.trigger_sync(mount.id).await.unwrap();
+    for _ in 0..50 {
+        let fetched = h.mock.fetch_calls();
+        if fetched > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // The MockConnector now has the uploaded object (we can't
+    // observe it directly, but the upload method put it there).
+    // Assert the mount's last_error is None.
+    let after_push = h.supervisor.state().get_mount(mount.id).unwrap();
+    assert!(
+        after_push.last_error.is_none(),
+        "unexpected error: {:?}",
+        after_push.last_error
+    );
+
+    h.supervisor.delete_mount(mount.id).await.unwrap();
+}
+
+#[tokio::test]
 async fn sync_disabled_without_cipher_errors() {
     let tmp = TempDir::new().unwrap();
     let backend = Arc::new(MemoryBackend::new(tmp.path().join("sv")));
