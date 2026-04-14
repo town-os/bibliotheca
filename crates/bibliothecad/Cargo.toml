@@ -26,6 +26,8 @@ bibliotheca-admin.workspace = true
 bibliotheca-sync-core.workspace = true
 bibliotheca-sync-ipfs.workspace = true
 bibliotheca-sync-dropbox.workspace = true
+bibliotheca-sync-nextcloud.workspace = true
+bibliotheca-sync-solid.workspace = true
 
 anyhow.workspace = true
 async-trait.workspace = true

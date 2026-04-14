@@ -87,6 +87,8 @@ pub async fn boot(
     // connector crates hook in here.
     bibliotheca_sync_ipfs::IpfsSyncConnector::register(&registry);
     bibliotheca_sync_dropbox::DropboxConnector::register(&registry);
+    bibliotheca_sync_nextcloud::NextcloudConnector::register(&registry);
+    bibliotheca_sync_solid::SolidConnector::register(&registry);
 
     let supervisor = Arc::new(Supervisor::new(
         svc,

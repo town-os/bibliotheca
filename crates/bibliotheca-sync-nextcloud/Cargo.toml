@@ -1,0 +1,26 @@
+[package]
+name = "bibliotheca-sync-nextcloud"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bibliotheca-sync-core.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+time.workspace = true
+url.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+serde.workspace = true
+serde_json.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+axum = { workspace = true, features = ["macros"] }
+tokio = { workspace = true, features = ["full"] }
+serde.workspace = true
+serde_json.workspace = true
+parking_lot.workspace = true
