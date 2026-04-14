@@ -28,6 +28,7 @@ bibliotheca-sync-ipfs.workspace = true
 bibliotheca-sync-dropbox.workspace = true
 bibliotheca-sync-nextcloud.workspace = true
 bibliotheca-sync-solid.workspace = true
+bibliotheca-sync-gphotos.workspace = true
 
 anyhow.workspace = true
 async-trait.workspace = true

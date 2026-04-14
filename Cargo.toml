@@ -19,6 +19,7 @@ members = [
     "crates/bibliotheca-sync-dropbox",
     "crates/bibliotheca-sync-nextcloud",
     "crates/bibliotheca-sync-solid",
+    "crates/bibliotheca-sync-gphotos",
     "crates/bibliothecad",
     "crates/bibliothecactl",
 ]
@@ -49,6 +50,7 @@ bibliotheca-sync-ipfs = { path = "crates/bibliotheca-sync-ipfs" }
 bibliotheca-sync-dropbox = { path = "crates/bibliotheca-sync-dropbox" }
 bibliotheca-sync-nextcloud = { path = "crates/bibliotheca-sync-nextcloud" }
 bibliotheca-sync-solid = { path = "crates/bibliotheca-sync-solid" }
+bibliotheca-sync-gphotos = { path = "crates/bibliotheca-sync-gphotos" }
 
 anyhow = "1"
 thiserror = "1"
