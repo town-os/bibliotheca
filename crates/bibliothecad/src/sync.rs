@@ -90,6 +90,7 @@ pub async fn boot(
     bibliotheca_sync_nextcloud::NextcloudConnector::register(&registry);
     bibliotheca_sync_solid::SolidConnector::register(&registry);
     bibliotheca_sync_gphotos::GooglePhotosConnector::register(&registry);
+    bibliotheca_sync_icloud::ICloudConnector::register(&registry);
 
     let supervisor = Arc::new(Supervisor::new(
         svc,

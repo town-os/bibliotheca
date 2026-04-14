@@ -20,6 +20,7 @@ members = [
     "crates/bibliotheca-sync-nextcloud",
     "crates/bibliotheca-sync-solid",
     "crates/bibliotheca-sync-gphotos",
+    "crates/bibliotheca-sync-icloud",
     "crates/bibliothecad",
     "crates/bibliothecactl",
 ]
@@ -51,6 +52,7 @@ bibliotheca-sync-dropbox = { path = "crates/bibliotheca-sync-dropbox" }
 bibliotheca-sync-nextcloud = { path = "crates/bibliotheca-sync-nextcloud" }
 bibliotheca-sync-solid = { path = "crates/bibliotheca-sync-solid" }
 bibliotheca-sync-gphotos = { path = "crates/bibliotheca-sync-gphotos" }
+bibliotheca-sync-icloud = { path = "crates/bibliotheca-sync-icloud" }
 
 anyhow = "1"
 thiserror = "1"
@@ -86,6 +88,9 @@ sha2 = "0.10"
 base64 = "0.22"
 aes-gcm = "0.10"
 hex = "0.4"
+srp = "0.6"
+num-bigint = "0.4"
+pbkdf2 = "0.12"
 rusqlite = { version = "0.32", features = ["bundled"] }
 parking_lot = "0.12"
 url = "2"
