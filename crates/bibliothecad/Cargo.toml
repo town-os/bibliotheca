@@ -24,6 +24,8 @@ bibliotheca-icloud.workspace = true
 bibliotheca-photos.workspace = true
 bibliotheca-admin.workspace = true
 bibliotheca-sync-core.workspace = true
+bibliotheca-sync-ipfs.workspace = true
+bibliotheca-sync-dropbox.workspace = true
 
 anyhow.workspace = true
 async-trait.workspace = true

@@ -83,7 +83,10 @@ pub async fn boot(
 
     let state = SyncStateStore::new(store);
     let registry = ConnectorRegistry::new();
-    // Phase 2+ crates register themselves here.
+    // Register connectors that ship with the daemon. Additional
+    // connector crates hook in here.
+    bibliotheca_sync_ipfs::IpfsSyncConnector::register(&registry);
+    bibliotheca_sync_dropbox::DropboxConnector::register(&registry);
 
     let supervisor = Arc::new(Supervisor::new(
         svc,
