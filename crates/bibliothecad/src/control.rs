@@ -7,6 +7,8 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::sync::Arc;
 
 use bibliotheca_core::acl::{Acl, AclEntry, Permission, Principal};
 use bibliotheca_core::error::Error;
@@ -17,7 +19,12 @@ use bibliotheca_proto::v1::identity_server::{Identity, IdentityServer};
 use bibliotheca_proto::v1::interfaces_server::{Interfaces, InterfacesServer};
 use bibliotheca_proto::v1::ipfs_server::{Ipfs, IpfsServer};
 use bibliotheca_proto::v1::storage_server::{Storage, StorageServer};
+use bibliotheca_proto::v1::sync_admin_server::{SyncAdmin, SyncAdminServer};
 use bibliotheca_proto::v1::{self as pb};
+use bibliotheca_sync_core::{
+    ConnectorKind, CredentialBlob, Direction, MountId, MountSpec, Supervisor, SyncMount,
+};
+use futures::Stream;
 use prost_types::Timestamp;
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -25,7 +32,11 @@ use tonic::{transport::Server, Request, Response, Status};
 use tracing::info;
 use uuid::Uuid;
 
-pub async fn serve(svc: BibliothecaService, socket: PathBuf) -> anyhow::Result<()> {
+pub async fn serve(
+    svc: BibliothecaService,
+    supervisor: Option<Arc<Supervisor>>,
+    socket: PathBuf,
+) -> anyhow::Result<()> {
     if socket.exists() {
         std::fs::remove_file(&socket)?;
     }
@@ -37,12 +48,16 @@ pub async fn serve(svc: BibliothecaService, socket: PathBuf) -> anyhow::Result<(
     let storage = StorageSvc { svc: svc.clone() };
     let interfaces = InterfacesSvc {};
     let ipfs = IpfsSvc { svc };
+    let sync = SyncAdminSvc {
+        supervisor: supervisor.clone(),
+    };
 
     Server::builder()
         .add_service(IdentityServer::new(identity))
         .add_service(StorageServer::new(storage))
         .add_service(InterfacesServer::new(interfaces))
         .add_service(IpfsServer::new(ipfs))
+        .add_service(SyncAdminServer::new(sync))
         .serve_with_incoming(stream)
         .await?;
     Ok(())
@@ -581,5 +596,357 @@ impl Ipfs for IpfsSvc {
         _req: Request<pb::ListPinsRequest>,
     ) -> Result<Response<pb::ListPinsResponse>, Status> {
         Err(Status::unimplemented("ipfs client not configured"))
+    }
+}
+
+// ---------- SyncAdmin ----------
+
+pub struct SyncAdminSvc {
+    supervisor: Option<Arc<Supervisor>>,
+}
+
+impl SyncAdminSvc {
+    fn require(&self) -> Result<&Supervisor, Status> {
+        match self.supervisor.as_deref() {
+            Some(s) if s.is_enabled() => Ok(s),
+            Some(_) => Err(Status::unavailable(
+                "sync subsystem disabled: no secret key or town-os config",
+            )),
+            None => Err(Status::unavailable(
+                "sync subsystem disabled: supervisor not constructed",
+            )),
+        }
+    }
+}
+
+fn sync_err(e: bibliotheca_sync_core::Error) -> Status {
+    use bibliotheca_sync_core::Error as E;
+    match e {
+        E::NotFound(m) => Status::not_found(m),
+        E::AlreadyExists(m) => Status::already_exists(m),
+        E::InvalidArgument(m) => Status::invalid_argument(m),
+        E::PermissionDenied => Status::permission_denied("denied"),
+        E::SyncDisabled(m) => Status::unavailable(m),
+        E::UnknownConnector(m) => Status::unimplemented(format!("connector: {m}")),
+        E::NeedsTwoFactor => Status::failed_precondition("two-factor required"),
+        E::QuotaExceeded => Status::resource_exhausted("quota exceeded"),
+        E::Core(c) => to_status(c),
+        other => Status::internal(other.to_string()),
+    }
+}
+
+fn mount_to_pb(m: &SyncMount) -> pb::SyncMount {
+    pb::SyncMount {
+        id: m.id.to_string(),
+        name: m.name.clone(),
+        kind: connector_kind_to_pb(m.kind) as i32,
+        subvolume_id: m.subvolume_id.to_string(),
+        townos_name: m.townos_name.clone(),
+        direction: direction_to_pb(m.direction) as i32,
+        interval_secs: m.interval_secs,
+        quota_bytes: m.quota_bytes,
+        enabled: m.enabled,
+        paused: m.paused,
+        last_sync_at: m.last_sync_at.map(ts),
+        last_error: m.last_error.clone().unwrap_or_default(),
+        created_at: Some(ts(m.created_at)),
+        config: parse_config_map(&m.config_json),
+    }
+}
+
+fn parse_config_map(s: &str) -> std::collections::HashMap<String, String> {
+    serde_json::from_str(s).unwrap_or_default()
+}
+
+fn connector_kind_from_pb(k: i32) -> Result<ConnectorKind, Status> {
+    Ok(
+        match pb::SyncConnectorKind::try_from(k).map_err(|_| Status::invalid_argument("kind"))? {
+            pb::SyncConnectorKind::SyncConnectorUnspecified => {
+                return Err(Status::invalid_argument("connector kind unspecified"))
+            }
+            pb::SyncConnectorKind::SyncConnectorIcloudPhotos => ConnectorKind::ICloudPhotos,
+            pb::SyncConnectorKind::SyncConnectorDropbox => ConnectorKind::Dropbox,
+            pb::SyncConnectorKind::SyncConnectorNextcloud => ConnectorKind::Nextcloud,
+            pb::SyncConnectorKind::SyncConnectorSolid => ConnectorKind::Solid,
+            pb::SyncConnectorKind::SyncConnectorGooglePhotos => ConnectorKind::GooglePhotos,
+            pb::SyncConnectorKind::SyncConnectorIpfs => ConnectorKind::Ipfs,
+        },
+    )
+}
+
+fn connector_kind_to_pb(k: ConnectorKind) -> pb::SyncConnectorKind {
+    match k {
+        ConnectorKind::ICloudPhotos => pb::SyncConnectorKind::SyncConnectorIcloudPhotos,
+        ConnectorKind::Dropbox => pb::SyncConnectorKind::SyncConnectorDropbox,
+        ConnectorKind::Nextcloud => pb::SyncConnectorKind::SyncConnectorNextcloud,
+        ConnectorKind::Solid => pb::SyncConnectorKind::SyncConnectorSolid,
+        ConnectorKind::GooglePhotos => pb::SyncConnectorKind::SyncConnectorGooglePhotos,
+        ConnectorKind::Ipfs => pb::SyncConnectorKind::SyncConnectorIpfs,
+    }
+}
+
+fn direction_from_pb(d: i32) -> Result<Direction, Status> {
+    Ok(
+        match pb::SyncDirection::try_from(d).map_err(|_| Status::invalid_argument("direction"))? {
+            pb::SyncDirection::Unspecified => Direction::Pull,
+            pb::SyncDirection::Pull => Direction::Pull,
+            pb::SyncDirection::Push => Direction::Push,
+            pb::SyncDirection::Both => Direction::Both,
+        },
+    )
+}
+
+fn direction_to_pb(d: Direction) -> pb::SyncDirection {
+    match d {
+        Direction::Pull => pb::SyncDirection::Pull,
+        Direction::Push => pb::SyncDirection::Push,
+        Direction::Both => pb::SyncDirection::Both,
+    }
+}
+
+fn credentials_from_pb(
+    creds: Option<pb::create_mount_request::Credentials>,
+) -> Result<CredentialBlob, Status> {
+    use pb::create_mount_request::Credentials as C;
+    match creds.ok_or_else(|| Status::invalid_argument("missing credentials"))? {
+        C::Oauth2(o) => Ok(CredentialBlob::OAuth2 {
+            access_token: o.access_token,
+            refresh_token: o.refresh_token,
+            expires_at: o.expires_at,
+            client_id: o.client_id,
+            client_secret: o.client_secret,
+            token_url: o.token_url,
+        }),
+        C::Basic(b) => Ok(CredentialBlob::Basic {
+            username: b.username,
+            password: b.password,
+        }),
+        C::Token(t) => Ok(CredentialBlob::Token {
+            token: t.token,
+            refresh_token: if t.refresh_token.is_empty() {
+                None
+            } else {
+                Some(t.refresh_token)
+            },
+            expires_at: if t.expires_at == 0 {
+                None
+            } else {
+                Some(t.expires_at)
+            },
+        }),
+        C::Icloud(i) => Ok(CredentialBlob::ICloud {
+            apple_id: i.apple_id,
+            password: i.password,
+            trust_token: None,
+            session_cookies: Vec::new(),
+            anisette_url: i.anisette_url,
+        }),
+        C::Ipfs(i) => Ok(CredentialBlob::Ipfs {
+            api_url: i.api_url,
+            auth_header: if i.auth_header.is_empty() {
+                None
+            } else {
+                Some(i.auth_header)
+            },
+        }),
+    }
+}
+
+fn parse_mount_id(s: &str) -> Result<MountId, Status> {
+    Uuid::parse_str(s)
+        .map(MountId)
+        .map_err(|_| Status::invalid_argument("mount id"))
+}
+
+type TailStream = Pin<Box<dyn Stream<Item = Result<pb::SyncEvent, Status>> + Send>>;
+
+#[tonic::async_trait]
+impl SyncAdmin for SyncAdminSvc {
+    async fn create_mount(
+        &self,
+        req: Request<pb::CreateMountRequest>,
+    ) -> Result<Response<pb::SyncMount>, Status> {
+        let sup = self.require()?;
+        let r = req.into_inner();
+        let kind = connector_kind_from_pb(r.kind)?;
+        let direction = direction_from_pb(r.direction)?;
+        let owner = parse_user_id(&r.owner_user_id)?;
+        let blob = credentials_from_pb(r.credentials)?;
+        let config_json = serde_json::to_string(&r.config)
+            .map_err(|e| Status::invalid_argument(format!("config: {e}")))?;
+        let spec = MountSpec {
+            name: r.name,
+            kind,
+            direction,
+            interval_secs: if r.interval_secs == 0 {
+                300
+            } else {
+                r.interval_secs
+            },
+            quota_bytes: r.quota_bytes,
+            owner,
+            config_json,
+            credentials_id: None,
+        };
+        let mount = sup.create_mount(spec, blob).await.map_err(sync_err)?;
+        Ok(Response::new(mount_to_pb(&mount)))
+    }
+
+    async fn list_mounts(
+        &self,
+        _req: Request<()>,
+    ) -> Result<Response<pb::ListMountsResponse>, Status> {
+        let sup = self.require()?;
+        let mounts = sup.state().list_mounts().map_err(sync_err)?;
+        Ok(Response::new(pb::ListMountsResponse {
+            mounts: mounts.iter().map(mount_to_pb).collect(),
+        }))
+    }
+
+    async fn get_mount(
+        &self,
+        req: Request<pb::GetMountRequest>,
+    ) -> Result<Response<pb::SyncMount>, Status> {
+        let sup = self.require()?;
+        let r = req.into_inner();
+        let mount = if let Ok(id) = Uuid::parse_str(&r.id_or_name) {
+            sup.state().get_mount(MountId(id)).map_err(sync_err)?
+        } else {
+            sup.state()
+                .get_mount_by_name(&r.id_or_name)
+                .map_err(sync_err)?
+        };
+        Ok(Response::new(mount_to_pb(&mount)))
+    }
+
+    async fn update_mount(
+        &self,
+        req: Request<pb::UpdateMountRequest>,
+    ) -> Result<Response<pb::SyncMount>, Status> {
+        let sup = self.require()?;
+        let r = req.into_inner();
+        let id = parse_mount_id(&r.id)?;
+        if let Some(q) = r.quota_bytes {
+            sup.update_quota(id, q).await.map_err(sync_err)?;
+        }
+        if let Some(i) = r.interval_secs {
+            sup.update_interval(id, i).await.map_err(sync_err)?;
+        }
+        if let Some(d) = r.direction {
+            let direction = direction_from_pb(d)?;
+            sup.update_direction(id, direction)
+                .await
+                .map_err(sync_err)?;
+        }
+        let mount = sup.state().get_mount(id).map_err(sync_err)?;
+        Ok(Response::new(mount_to_pb(&mount)))
+    }
+
+    async fn delete_mount(
+        &self,
+        req: Request<pb::DeleteMountRequest>,
+    ) -> Result<Response<()>, Status> {
+        let sup = self.require()?;
+        let id = parse_mount_id(&req.into_inner().id)?;
+        sup.delete_mount(id).await.map_err(sync_err)?;
+        Ok(Response::new(()))
+    }
+
+    async fn pause(
+        &self,
+        req: Request<pb::MountIdRequest>,
+    ) -> Result<Response<pb::SyncMount>, Status> {
+        let sup = self.require()?;
+        let id = parse_mount_id(&req.into_inner().id)?;
+        let mount = sup.pause(id).await.map_err(sync_err)?;
+        Ok(Response::new(mount_to_pb(&mount)))
+    }
+
+    async fn resume(
+        &self,
+        req: Request<pb::MountIdRequest>,
+    ) -> Result<Response<pb::SyncMount>, Status> {
+        let sup = self.require()?;
+        let id = parse_mount_id(&req.into_inner().id)?;
+        let mount = sup.resume(id).await.map_err(sync_err)?;
+        Ok(Response::new(mount_to_pb(&mount)))
+    }
+
+    async fn trigger_sync(&self, req: Request<pb::MountIdRequest>) -> Result<Response<()>, Status> {
+        let sup = self.require()?;
+        let id = parse_mount_id(&req.into_inner().id)?;
+        sup.trigger_sync(id).await.map_err(sync_err)?;
+        Ok(Response::new(()))
+    }
+
+    async fn submit_two_factor_code(
+        &self,
+        req: Request<pb::SubmitTwoFactorCodeRequest>,
+    ) -> Result<Response<()>, Status> {
+        let sup = self.require()?;
+        let r = req.into_inner();
+        let id = parse_mount_id(&r.id)?;
+        sup.submit_twofactor(id, r.code).map_err(sync_err)?;
+        Ok(Response::new(()))
+    }
+
+    type TailEventsStream = TailStream;
+
+    async fn tail_events(
+        &self,
+        req: Request<pb::TailEventsRequest>,
+    ) -> Result<Response<Self::TailEventsStream>, Status> {
+        let sup = self.require()?;
+        let r = req.into_inner();
+        let mut rx = sup.events();
+        let mount_filter = if r.mount_id.is_empty() {
+            None
+        } else {
+            Some(parse_mount_id(&r.mount_id)?)
+        };
+        let stream = async_stream::stream! {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => {
+                        if let Some(f) = mount_filter {
+                            if ev.mount_id != f {
+                                continue;
+                            }
+                        }
+                        let details = match ev.details.clone() {
+                            serde_json::Value::Object(m) => m
+                                .into_iter()
+                                .map(|(k, v)| (k, v.to_string()))
+                                .collect(),
+                            _ => Default::default(),
+                        };
+                        yield Ok(pb::SyncEvent {
+                            mount_id: ev.mount_id.to_string(),
+                            ts: Some(ts(ev.ts)),
+                            level: ev.level.as_wire().to_string(),
+                            kind: ev.kind,
+                            message: ev.message,
+                            details,
+                        });
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+        };
+        Ok(Response::new(Box::pin(stream)))
+    }
+
+    async fn rotate_secret_key(
+        &self,
+        req: Request<pb::RotateSecretKeyRequest>,
+    ) -> Result<Response<()>, Status> {
+        let sup = self.require()?;
+        let n = sup
+            .rotate_master_key(&req.into_inner().new_hex_key)
+            .await
+            .map_err(sync_err)?;
+        info!(rotated = n, "sync secret key rotated");
+        Ok(Response::new(()))
     }
 }

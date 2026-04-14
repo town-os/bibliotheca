@@ -23,12 +23,14 @@ bibliotheca-gcs.workspace = true
 bibliotheca-icloud.workspace = true
 bibliotheca-photos.workspace = true
 bibliotheca-admin.workspace = true
+bibliotheca-sync-core.workspace = true
 
 anyhow.workspace = true
 async-trait.workspace = true
 clap.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
+tokio-util.workspace = true
 tonic.workspace = true
 prost.workspace = true
 prost-types.workspace = true
@@ -39,6 +41,9 @@ serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
 time.workspace = true
+futures.workspace = true
+async-stream.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 bibliotheca-core = { workspace = true, features = ["test-support"] }

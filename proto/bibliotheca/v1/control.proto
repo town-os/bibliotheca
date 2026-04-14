@@ -224,3 +224,142 @@ message ExportRequest {
 message ExportResponse { uint64 bytes_written = 1; }
 message ListPinsRequest { string subvolume_id = 1; }
 message ListPinsResponse { repeated PinResponse pins = 1; }
+
+// =====================================================================
+// SyncAdmin — manages client-side sync mounts that pull (and
+// eventually push) content from remote services (iCloud, Dropbox,
+// Google Photos, Solid, Nextcloud/WebDAV, IPFS) into local
+// subvolumes procured from the town-os systemcontroller.
+//
+// Credentials travel over this socket only; they are encrypted at
+// rest with the daemon's master key. The gRPC client (bibliothecactl)
+// is expected to read them from files or stdin rather than accept
+// them on the command line.
+// =====================================================================
+
+enum SyncConnectorKind {
+  SYNC_CONNECTOR_UNSPECIFIED = 0;
+  SYNC_CONNECTOR_ICLOUD_PHOTOS = 1;
+  SYNC_CONNECTOR_DROPBOX = 2;
+  SYNC_CONNECTOR_NEXTCLOUD = 3;
+  SYNC_CONNECTOR_SOLID = 4;
+  SYNC_CONNECTOR_GOOGLE_PHOTOS = 5;
+  SYNC_CONNECTOR_IPFS = 6;
+}
+
+enum SyncDirection {
+  SYNC_DIRECTION_UNSPECIFIED = 0;
+  SYNC_DIRECTION_PULL = 1;
+  SYNC_DIRECTION_PUSH = 2;
+  SYNC_DIRECTION_BOTH = 3;
+}
+
+message SyncMount {
+  string id = 1;
+  string name = 2;
+  SyncConnectorKind kind = 3;
+  string subvolume_id = 4;
+  string townos_name = 5;
+  SyncDirection direction = 6;
+  uint32 interval_secs = 7;
+  uint64 quota_bytes = 8;
+  bool enabled = 9;
+  bool paused = 10;
+  google.protobuf.Timestamp last_sync_at = 11;
+  string last_error = 12;
+  google.protobuf.Timestamp created_at = 13;
+  map<string, string> config = 14;
+}
+
+// Credential variants. Exactly one must be set on CreateMount.
+
+message OAuth2Credentials {
+  string access_token = 1;
+  string refresh_token = 2;
+  int64 expires_at = 3;
+  string client_id = 4;
+  string client_secret = 5;
+  string token_url = 6;
+}
+
+message BasicCredentials {
+  string username = 1;
+  string password = 2;
+}
+
+message TokenCredentials {
+  string token = 1;
+  string refresh_token = 2;
+  int64 expires_at = 3;
+}
+
+message ICloudCredentials {
+  string apple_id = 1;
+  string password = 2;
+  string anisette_url = 3;
+}
+
+message IpfsCredentials {
+  string api_url = 1;
+  string auth_header = 2;
+}
+
+message CreateMountRequest {
+  string name = 1;
+  SyncConnectorKind kind = 2;
+  SyncDirection direction = 3;
+  uint64 quota_bytes = 4;      // 0 → use daemon default
+  uint32 interval_secs = 5;
+  string owner_user_id = 6;
+  map<string, string> config = 7;
+
+  oneof credentials {
+    OAuth2Credentials oauth2 = 10;
+    BasicCredentials basic = 11;
+    TokenCredentials token = 12;
+    ICloudCredentials icloud = 13;
+    IpfsCredentials ipfs = 14;
+  }
+}
+
+message UpdateMountRequest {
+  string id = 1;
+  optional uint32 interval_secs = 2;
+  optional SyncDirection direction = 3;
+  optional uint64 quota_bytes = 4;
+}
+
+message DeleteMountRequest { string id = 1; }
+message MountIdRequest { string id = 1; }
+message GetMountRequest { string id_or_name = 1; }
+message ListMountsResponse { repeated SyncMount mounts = 1; }
+message SubmitTwoFactorCodeRequest { string id = 1; string code = 2; }
+message RotateSecretKeyRequest { string new_hex_key = 1; }
+
+message TailEventsRequest {
+  string mount_id = 1;
+  int64 since_unix = 2;
+}
+
+message SyncEvent {
+  string mount_id = 1;
+  google.protobuf.Timestamp ts = 2;
+  string level = 3;
+  string kind = 4;
+  string message = 5;
+  map<string, string> details = 6;
+}
+
+service SyncAdmin {
+  rpc CreateMount(CreateMountRequest) returns (SyncMount);
+  rpc ListMounts(google.protobuf.Empty) returns (ListMountsResponse);
+  rpc GetMount(GetMountRequest) returns (SyncMount);
+  rpc UpdateMount(UpdateMountRequest) returns (SyncMount);
+  rpc DeleteMount(DeleteMountRequest) returns (google.protobuf.Empty);
+  rpc Pause(MountIdRequest) returns (SyncMount);
+  rpc Resume(MountIdRequest) returns (SyncMount);
+  rpc TriggerSync(MountIdRequest) returns (google.protobuf.Empty);
+  rpc SubmitTwoFactorCode(SubmitTwoFactorCodeRequest) returns (google.protobuf.Empty);
+  rpc TailEvents(TailEventsRequest) returns (stream SyncEvent);
+  rpc RotateSecretKey(RotateSecretKeyRequest) returns (google.protobuf.Empty);
+}

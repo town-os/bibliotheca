@@ -10,3 +10,4 @@
 
 pub mod control;
 pub mod interfaces;
+pub mod sync;

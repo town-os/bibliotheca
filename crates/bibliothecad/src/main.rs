@@ -13,10 +13,15 @@ use bibliotheca_core::backend::SubvolumeBackend;
 use bibliotheca_core::service::BibliothecaService;
 use bibliotheca_core::store::Store;
 use clap::Parser;
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 use tracing_subscriber::{prelude::*, EnvFilter};
+use url::Url;
 
-use bibliothecad::{control, interfaces};
+use bibliothecad::sync::SyncBootConfig;
+use bibliothecad::{control, interfaces, sync};
+
+const DEFAULT_SYNC_QUOTA: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
 
 #[derive(Debug, Parser)]
 #[command(
@@ -58,6 +63,42 @@ struct Args {
     /// default that the spec requires for HTTP).
     #[arg(long, env = "BIBLIOTHECA_INTERFACES")]
     interfaces: Option<PathBuf>,
+
+    /// town-os systemcontroller base URL, used by the sync subsystem
+    /// to procure subvolumes for mounts.
+    #[arg(long, env = "BIBLIOTHECA_TOWNOS_URL")]
+    townos_url: Option<Url>,
+
+    /// town-os username to authenticate as when provisioning storage.
+    #[arg(long, env = "BIBLIOTHECA_TOWNOS_USERNAME")]
+    townos_username: Option<String>,
+
+    /// File containing the town-os password. Stored out-of-band so it
+    /// never appears on the command line or in process listings.
+    #[arg(long, env = "BIBLIOTHECA_TOWNOS_PASSWORD_FILE")]
+    townos_password_file: Option<PathBuf>,
+
+    /// Absolute filesystem path under which town-os mounts the
+    /// subvolumes it creates. A procured volume named
+    /// `user/sync-alice-icloud` is accessed at
+    /// `{storage_root}/user/sync-alice-icloud`.
+    #[arg(
+        long,
+        env = "BIBLIOTHECA_TOWNOS_STORAGE_ROOT",
+        default_value = "/var/lib/townos/storage"
+    )]
+    townos_storage_root: PathBuf,
+
+    /// File containing the 32-byte (hex-encoded) master key used to
+    /// encrypt sync connector credentials at rest. Without it, the
+    /// sync subsystem refuses to start.
+    #[arg(long, env = "BIBLIOTHECA_SYNC_SECRET_KEY_FILE")]
+    sync_secret_key_file: Option<PathBuf>,
+
+    /// Default quota (in bytes) applied to a new sync mount if the
+    /// create request does not specify one.
+    #[arg(long, default_value_t = DEFAULT_SYNC_QUOTA)]
+    sync_default_quota_bytes: u64,
 }
 
 #[tokio::main]
@@ -80,12 +121,30 @@ async fn main() -> anyhow::Result<()> {
     let store = Store::open(&args.db)?;
     let backend: Arc<dyn SubvolumeBackend> =
         Arc::new(BtrfsBackend::new(args.root.clone()).with_bin(args.btrfs_bin.clone()));
-    let svc = BibliothecaService::new(store, backend);
+    let svc = BibliothecaService::new(store.clone(), backend);
 
-    let interfaces = interfaces::load(args.interfaces.as_deref())?;
-    interfaces::spawn_enabled(svc.clone(), &interfaces);
+    let ifaces = interfaces::load(args.interfaces.as_deref())?;
+    interfaces::spawn_enabled(svc.clone(), &ifaces);
 
-    control::serve(svc, args.socket.clone()).await?;
+    let shutdown = CancellationToken::new();
+    let supervisor = sync::boot(
+        svc.clone(),
+        store,
+        SyncBootConfig {
+            townos_url: args.townos_url,
+            townos_username: args.townos_username,
+            townos_password_file: args.townos_password_file,
+            townos_storage_root: args.townos_storage_root,
+            secret_key_file: args.sync_secret_key_file,
+            secret_key_env: Some("BIBLIOTHECA_SECRET_KEY".to_string()),
+            default_quota_bytes: args.sync_default_quota_bytes,
+        },
+        shutdown.clone(),
+    )
+    .await?;
+
+    control::serve(svc, supervisor, args.socket.clone()).await?;
+    shutdown.cancel();
     info!("bibliothecad shutting down");
     Ok(())
 }

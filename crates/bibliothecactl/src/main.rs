@@ -5,12 +5,14 @@ use std::path::PathBuf;
 
 use bibliotheca_proto::v1::identity_client::IdentityClient;
 use bibliotheca_proto::v1::storage_client::StorageClient;
+use bibliotheca_proto::v1::sync_admin_client::SyncAdminClient;
 use bibliotheca_proto::v1::{
-    AddUserToGroupRequest, CreateGroupRequest, CreateSubvolumeRequest, CreateUserRequest,
-    DeleteSubvolumeRequest, DeleteUserRequest, ListGroupsRequest, ListSubvolumesRequest,
-    ListUsersRequest, SetQuotaRequest,
+    self as pb, AddUserToGroupRequest, CreateGroupRequest, CreateSubvolumeRequest,
+    CreateUserRequest, DeleteSubvolumeRequest, DeleteUserRequest, ListGroupsRequest,
+    ListSubvolumesRequest, ListUsersRequest, SetQuotaRequest,
 };
 use clap::{Parser, Subcommand};
+use futures::StreamExt;
 use hyper_util::rt::TokioIo;
 use tokio::net::UnixStream;
 use tonic::transport::{Endpoint, Uri};
@@ -44,6 +46,11 @@ enum Cmd {
     Subvolume {
         #[command(subcommand)]
         cmd: SubvolumeCmd,
+    },
+    /// Sync connector mounts.
+    Sync {
+        #[command(subcommand)]
+        cmd: SyncCmd,
     },
 }
 
@@ -98,6 +105,108 @@ enum SubvolumeCmd {
         id: String,
         bytes: u64,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum SyncCmd {
+    /// Mount management.
+    Mount {
+        #[command(subcommand)]
+        cmd: SyncMountCmd,
+    },
+    /// Submit a two-factor code for a mount blocked on 2FA auth
+    /// (iCloud, typically).
+    Twofactor {
+        #[command(subcommand)]
+        cmd: SyncTwofactorCmd,
+    },
+    /// Tail sync events over a server-streaming RPC.
+    Events {
+        #[command(subcommand)]
+        cmd: SyncEventsCmd,
+    },
+    /// Rotate the master encryption key for credentials at rest.
+    Secret {
+        #[command(subcommand)]
+        cmd: SyncSecretCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SyncMountCmd {
+    /// Create a new mount. Credentials are read from a file (JSON)
+    /// to keep them out of the process command line.
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        kind: String,
+        #[arg(long, default_value = "pull")]
+        direction: String,
+        #[arg(long)]
+        owner: String,
+        #[arg(long, default_value_t = 0)]
+        quota_bytes: u64,
+        #[arg(long, default_value_t = 300)]
+        interval_secs: u32,
+        /// Path to a JSON file describing the credentials to use.
+        /// Shape matches the CredentialBlob enum — e.g.
+        /// `{"kind":"basic","username":"alice","password":"hunter2"}`.
+        #[arg(long)]
+        credentials_file: PathBuf,
+        /// Repeatable `--config key=val`.
+        #[arg(long = "config", value_parser = parse_kv)]
+        config: Vec<(String, String)>,
+    },
+    List,
+    Get {
+        id_or_name: String,
+    },
+    SetQuota {
+        id: String,
+        bytes: u64,
+    },
+    Pause {
+        id: String,
+    },
+    Resume {
+        id: String,
+    },
+    Trigger {
+        id: String,
+    },
+    Delete {
+        id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SyncTwofactorCmd {
+    Submit { id: String, code: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum SyncEventsCmd {
+    Tail {
+        #[arg(long)]
+        mount: Option<String>,
+        #[arg(long, default_value_t = 0)]
+        since_unix: i64,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SyncSecretCmd {
+    Rotate {
+        #[arg(long)]
+        hex: String,
+    },
+}
+
+fn parse_kv(s: &str) -> Result<(String, String), String> {
+    s.split_once('=')
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .ok_or_else(|| format!("expected key=value, got: {s}"))
 }
 
 #[tokio::main]
@@ -188,6 +297,53 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Cmd::Sync { cmd } => {
+            let mut client = SyncAdminClient::new(channel);
+            match cmd {
+                SyncCmd::Mount { cmd } => run_sync_mount_cmd(&mut client, cmd).await?,
+                SyncCmd::Twofactor { cmd } => match cmd {
+                    SyncTwofactorCmd::Submit { id, code } => {
+                        client
+                            .submit_two_factor_code(pb::SubmitTwoFactorCodeRequest { id, code })
+                            .await?;
+                    }
+                },
+                SyncCmd::Events { cmd } => match cmd {
+                    SyncEventsCmd::Tail { mount, since_unix } => {
+                        let req = pb::TailEventsRequest {
+                            mount_id: mount.unwrap_or_default(),
+                            since_unix,
+                        };
+                        let mut stream = client.tail_events(req).await?.into_inner();
+                        while let Some(msg) = stream.next().await {
+                            match msg {
+                                Ok(ev) => {
+                                    let ts = ev.ts.map(|t| t.seconds).unwrap_or(0);
+                                    println!(
+                                        "{ts}\t{level}\t{kind}\t{mount}\t{msg}",
+                                        level = ev.level,
+                                        kind = ev.kind,
+                                        mount = ev.mount_id,
+                                        msg = ev.message
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!("stream error: {e}");
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                },
+                SyncCmd::Secret { cmd } => match cmd {
+                    SyncSecretCmd::Rotate { hex } => {
+                        client
+                            .rotate_secret_key(pb::RotateSecretKeyRequest { new_hex_key: hex })
+                            .await?;
+                    }
+                },
+            }
+        }
         Cmd::Subvolume { cmd } => {
             let mut client = StorageClient::new(channel);
             match cmd {
@@ -233,4 +389,147 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn print_mount(m: &pb::SyncMount) {
+    let kind = pb::SyncConnectorKind::try_from(m.kind)
+        .map(|k| k.as_str_name().to_string())
+        .unwrap_or_else(|_| m.kind.to_string());
+    let dir = pb::SyncDirection::try_from(m.direction)
+        .map(|d| d.as_str_name().to_string())
+        .unwrap_or_else(|_| m.direction.to_string());
+    let paused = if m.paused { "paused" } else { "active" };
+    println!(
+        "{id}\t{name}\t{kind}\t{dir}\t{quota}\t{paused}\t{err}",
+        id = m.id,
+        name = m.name,
+        kind = kind,
+        dir = dir,
+        quota = m.quota_bytes,
+        paused = paused,
+        err = m.last_error,
+    );
+}
+
+async fn run_sync_mount_cmd(
+    client: &mut SyncAdminClient<tonic::transport::Channel>,
+    cmd: SyncMountCmd,
+) -> anyhow::Result<()> {
+    match cmd {
+        SyncMountCmd::Create {
+            name,
+            kind,
+            direction,
+            owner,
+            quota_bytes,
+            interval_secs,
+            credentials_file,
+            config,
+        } => {
+            let kind_pb = match kind.as_str() {
+                "icloud" | "icloud_photos" => pb::SyncConnectorKind::SyncConnectorIcloudPhotos,
+                "dropbox" => pb::SyncConnectorKind::SyncConnectorDropbox,
+                "nextcloud" | "webdav" => pb::SyncConnectorKind::SyncConnectorNextcloud,
+                "solid" => pb::SyncConnectorKind::SyncConnectorSolid,
+                "gphotos" | "google_photos" => pb::SyncConnectorKind::SyncConnectorGooglePhotos,
+                "ipfs" => pb::SyncConnectorKind::SyncConnectorIpfs,
+                other => anyhow::bail!("unknown kind: {other}"),
+            };
+            let direction_pb = match direction.as_str() {
+                "pull" => pb::SyncDirection::Pull,
+                "push" => pb::SyncDirection::Push,
+                "both" => pb::SyncDirection::Both,
+                other => anyhow::bail!("unknown direction: {other}"),
+            };
+            let raw = std::fs::read(&credentials_file)?;
+            let blob: serde_json::Value = serde_json::from_slice(&raw)?;
+            let credentials = creds_from_json(&blob)?;
+            let config_map: std::collections::HashMap<String, String> =
+                config.into_iter().collect();
+            let req = pb::CreateMountRequest {
+                name,
+                kind: kind_pb as i32,
+                direction: direction_pb as i32,
+                quota_bytes,
+                interval_secs,
+                owner_user_id: owner,
+                config: config_map,
+                credentials: Some(credentials),
+            };
+            let resp = client.create_mount(req).await?;
+            print_mount(&resp.into_inner());
+        }
+        SyncMountCmd::List => {
+            let resp = client.list_mounts(()).await?;
+            for m in resp.into_inner().mounts {
+                print_mount(&m);
+            }
+        }
+        SyncMountCmd::Get { id_or_name } => {
+            let resp = client.get_mount(pb::GetMountRequest { id_or_name }).await?;
+            print_mount(&resp.into_inner());
+        }
+        SyncMountCmd::SetQuota { id, bytes } => {
+            let resp = client
+                .update_mount(pb::UpdateMountRequest {
+                    id,
+                    interval_secs: None,
+                    direction: None,
+                    quota_bytes: Some(bytes),
+                })
+                .await?;
+            print_mount(&resp.into_inner());
+        }
+        SyncMountCmd::Pause { id } => {
+            let resp = client.pause(pb::MountIdRequest { id }).await?;
+            print_mount(&resp.into_inner());
+        }
+        SyncMountCmd::Resume { id } => {
+            let resp = client.resume(pb::MountIdRequest { id }).await?;
+            print_mount(&resp.into_inner());
+        }
+        SyncMountCmd::Trigger { id } => {
+            client.trigger_sync(pb::MountIdRequest { id }).await?;
+        }
+        SyncMountCmd::Delete { id } => {
+            client.delete_mount(pb::DeleteMountRequest { id }).await?;
+        }
+    }
+    Ok(())
+}
+
+fn creds_from_json(v: &serde_json::Value) -> anyhow::Result<pb::create_mount_request::Credentials> {
+    let kind = v
+        .get("kind")
+        .and_then(|k| k.as_str())
+        .ok_or_else(|| anyhow::anyhow!("credentials file missing 'kind' field"))?;
+    Ok(match kind {
+        "basic" => pb::create_mount_request::Credentials::Basic(pb::BasicCredentials {
+            username: v["username"].as_str().unwrap_or("").to_string(),
+            password: v["password"].as_str().unwrap_or("").to_string(),
+        }),
+        "token" => pb::create_mount_request::Credentials::Token(pb::TokenCredentials {
+            token: v["token"].as_str().unwrap_or("").to_string(),
+            refresh_token: v["refresh_token"].as_str().unwrap_or("").to_string(),
+            expires_at: v["expires_at"].as_i64().unwrap_or(0),
+        }),
+        "oauth2" => pb::create_mount_request::Credentials::Oauth2(pb::OAuth2Credentials {
+            access_token: v["access_token"].as_str().unwrap_or("").to_string(),
+            refresh_token: v["refresh_token"].as_str().unwrap_or("").to_string(),
+            expires_at: v["expires_at"].as_i64().unwrap_or(0),
+            client_id: v["client_id"].as_str().unwrap_or("").to_string(),
+            client_secret: v["client_secret"].as_str().unwrap_or("").to_string(),
+            token_url: v["token_url"].as_str().unwrap_or("").to_string(),
+        }),
+        "icloud" => pb::create_mount_request::Credentials::Icloud(pb::ICloudCredentials {
+            apple_id: v["apple_id"].as_str().unwrap_or("").to_string(),
+            password: v["password"].as_str().unwrap_or("").to_string(),
+            anisette_url: v["anisette_url"].as_str().unwrap_or("").to_string(),
+        }),
+        "ipfs" => pb::create_mount_request::Credentials::Ipfs(pb::IpfsCredentials {
+            api_url: v["api_url"].as_str().unwrap_or("").to_string(),
+            auth_header: v["auth_header"].as_str().unwrap_or("").to_string(),
+        }),
+        other => anyhow::bail!("unknown credentials kind: {other}"),
+    })
 }

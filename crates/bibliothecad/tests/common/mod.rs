@@ -42,7 +42,7 @@ impl Harness {
         let svc_for_server = svc.clone();
         let socket_for_server = socket.clone();
         let server = tokio::spawn(async move {
-            bibliothecad::control::serve(svc_for_server, socket_for_server).await
+            bibliothecad::control::serve(svc_for_server, None, socket_for_server).await
         });
 
         // Wait until the socket appears, with a hard ceiling so a
