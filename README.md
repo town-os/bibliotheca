@@ -23,6 +23,7 @@ bibliotheca/
     ├── bibliotheca-nextcloud   # Nextcloud WebDAV + OCS
     ├── bibliotheca-gcs         # Google Cloud Storage JSON API
     ├── bibliotheca-icloud      # iCloud / CloudKit Web Services
+    ├── bibliotheca-photos      # Google Photos Library API
     ├── bibliotheca-admin       # HTML admin panel (indexed browsing)
     ├── bibliothecad            # the daemon binary
     └── bibliothecactl          # admin CLI talking to the daemon socket
@@ -104,6 +105,7 @@ same way for any deployment that exposes them on a public network.
   "nextcloud": { "enabled": false, "listen": "127.0.0.1:8446" },
   "gcs":       { "enabled": false, "listen": "127.0.0.1:8447" },
   "icloud":    { "enabled": false, "listen": "127.0.0.1:8448", "container": "iCloud.com.example" },
+  "photos":    { "enabled": false, "listen": "127.0.0.1:8449", "library": "photos" },
   "admin":     { "enabled": false, "listen": "127.0.0.1:8787", "admin_group": "admins" }
 }
 ```
@@ -177,6 +179,14 @@ end-to-end integration test that drives it over a real TCP socket.
 - `bibliotheca-icloud` — CloudKit Web Services shape:
   `records/query`, `records/lookup`, `records/modify` (create/delete),
   and `assets/upload` + asset download.
+- `bibliotheca-photos` — Google Photos Library API subset: raw
+  upload → upload-token → `mediaItems/batchCreate` two-step flow,
+  album create/list/get, mediaItems list/search/get, and byte
+  download. Albums are top-level directories inside a configurable
+  "library" subvolume (default `photos`); media items are files.
+  Note: Google's `:verb` convention is served at `/verb` here
+  because axum's matchit treats mid-segment `:` as a path
+  parameter.
 - `bibliotheca-ipfs` — real Kubo HTTP RPC client (`pin add`, `pin rm`,
   `pin ls`, `add`, `cat`), in addition to the existing `IpfsService`
   orchestration layer that handles ACLs and path-traversal guards.

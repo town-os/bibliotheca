@@ -23,6 +23,8 @@ pub struct InterfaceFile {
     #[serde(default)]
     pub icloud: Option<ICloudEntry>,
     #[serde(default)]
+    pub photos: Option<PhotosEntry>,
+    #[serde(default)]
     pub admin: Option<AdminEntry>,
 }
 
@@ -57,6 +59,19 @@ pub struct ICloudEntry {
     pub enabled: bool,
     pub listen: String,
     pub container: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PhotosEntry {
+    #[serde(default)]
+    pub enabled: bool,
+    pub listen: String,
+    #[serde(default = "default_photos_library")]
+    pub library: String,
+}
+
+fn default_photos_library() -> String {
+    "photos".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -219,6 +234,34 @@ pub fn spawn_enabled(svc: BibliothecaService, ifaces: &InterfaceFile) {
                 .await
                 {
                     warn!(error = %e, "icloud interface exited");
+                }
+            });
+        }
+    }
+
+    if let Some(cfg) = &ifaces.photos {
+        if cfg.enabled {
+            let svc = svc.clone();
+            let listen = cfg.listen.clone();
+            let library = cfg.library.clone();
+            tokio::spawn(async move {
+                let addr = match listen.parse() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        warn!(error = %e, "invalid photos listen");
+                        return;
+                    }
+                };
+                if let Err(e) = bibliotheca_photos::start(
+                    svc,
+                    bibliotheca_photos::PhotosConfig {
+                        listen: addr,
+                        library,
+                    },
+                )
+                .await
+                {
+                    warn!(error = %e, "photos interface exited");
                 }
             });
         }

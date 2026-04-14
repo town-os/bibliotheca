@@ -21,6 +21,7 @@ bibliotheca-dropbox.workspace = true
 bibliotheca-nextcloud.workspace = true
 bibliotheca-gcs.workspace = true
 bibliotheca-icloud.workspace = true
+bibliotheca-photos.workspace = true
 bibliotheca-admin.workspace = true
 
 anyhow.workspace = true
