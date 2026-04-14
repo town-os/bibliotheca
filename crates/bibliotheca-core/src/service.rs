@@ -108,6 +108,13 @@ impl BibliothecaService {
         self.store.remove_user_from_group(user, group)
     }
 
+    pub fn list_group_members(&self, group: GroupId) -> Result<Vec<User>> {
+        let ids = self.store.users_in_group(group)?;
+        ids.into_iter()
+            .map(|id| self.store.get_user_by_id(id))
+            .collect()
+    }
+
     // ---- subvolumes ----
 
     pub async fn create_subvolume(

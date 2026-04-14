@@ -23,6 +23,7 @@ bibliotheca/
     ├── bibliotheca-nextcloud   # Nextcloud WebDAV + OCS
     ├── bibliotheca-gcs         # Google Cloud Storage JSON API
     ├── bibliotheca-icloud      # iCloud / CloudKit Web Services
+    ├── bibliotheca-admin       # HTML admin panel (indexed browsing)
     ├── bibliothecad            # the daemon binary
     └── bibliothecactl          # admin CLI talking to the daemon socket
 ```
@@ -102,7 +103,8 @@ same way for any deployment that exposes them on a public network.
   "dropbox":   { "enabled": false, "listen": "127.0.0.1:8445" },
   "nextcloud": { "enabled": false, "listen": "127.0.0.1:8446" },
   "gcs":       { "enabled": false, "listen": "127.0.0.1:8447" },
-  "icloud":    { "enabled": false, "listen": "127.0.0.1:8448", "container": "iCloud.com.example" }
+  "icloud":    { "enabled": false, "listen": "127.0.0.1:8448", "container": "iCloud.com.example" },
+  "admin":     { "enabled": false, "listen": "127.0.0.1:8787", "admin_group": "admins" }
 }
 ```
 
@@ -148,8 +150,46 @@ bibliothecactl subvolume list
 
 Control plane (gRPC), identity, groups, ACL evaluation, sqlite store,
 btrfs backend wiring, daemon orchestration, and CLI are real and
-buildable. Each data-plane interface crate is wired into the daemon and
-shares the core `BibliothecaService`, but the protocol-specific handlers are
-deliberately stubbed — search for `TODO(spec)` in the interface crates
-for the extension points. The intent is to flesh those out incrementally
-without touching the control plane or the storage layer.
+buildable. Every data-plane interface now implements the object CRUD
+surface its protocol expects, sharing a single ACL-checked
+`bibliotheca-core::data::DataStore` helper so path-traversal and
+permission enforcement live in one place. Each transport ships with an
+end-to-end integration test that drives it over a real TCP socket.
+
+- `bibliotheca-http` — Basic auth, GET/HEAD/PUT/DELETE/LIST; `Public`
+  ACL entries honoured only when `allow_public = true`.
+- `bibliotheca-s3` — ListBuckets, CreateBucket, ListObjectsV2,
+  Put/Get/Head/Delete Object. Auth: HTTP Basic or a minimal
+  `AWS4-HMAC-SHA256 Credential=...` parser paired with a
+  `X-Amz-Bibliotheca-Secret` header.
+- `bibliotheca-solid` — LDP verbs (GET/HEAD/PUT/POST/DELETE/OPTIONS)
+  with Turtle directory listings, `Slug` header, and the double opt-in
+  `Public` ACL path from the HTTP interface.
+- `bibliotheca-dropbox` — `/2/files/{list_folder,upload,download,
+  delete_v2,get_metadata}` with `Authorization: Bearer
+  <base64(user:pass)>`.
+- `bibliotheca-nextcloud` — WebDAV (GET/HEAD/PUT/DELETE/MKCOL/
+  PROPFIND/OPTIONS) under `/remote.php/dav/files/<user>/…` plus a
+  minimal OCS shares envelope.
+- `bibliotheca-gcs` — JSON API for bucket and object CRUD, including
+  `?alt=media` downloads and `/upload/storage/v1` uploads, with Bearer
+  auth matching the Dropbox transport.
+- `bibliotheca-icloud` — CloudKit Web Services shape:
+  `records/query`, `records/lookup`, `records/modify` (create/delete),
+  and `assets/upload` + asset download.
+- `bibliotheca-ipfs` — real Kubo HTTP RPC client (`pin add`, `pin rm`,
+  `pin ls`, `add`, `cat`), in addition to the existing `IpfsService`
+  orchestration layer that handles ACLs and path-traversal guards.
+- `bibliotheca-admin` — HTML admin panel with indexed directory
+  browsing, file download, and read-only user/group/subvolume views.
+  Access is gated by membership in a configurable admin group
+  (default `admins`), and operations bypass subvolume ACLs — they
+  still go through the same `data::resolve_key` traversal guard the
+  other transports use. Disabled by default; bootstrap with
+  `bibliothecactl group create admins && bibliothecactl group add
+  admins <user-id>`.
+
+The daemon wiring and interface-enablement file are unchanged — see
+`crates/bibliothecad/src/interfaces.rs`. Adding a new transport still
+means writing one crate, implementing the protocol's verbs in terms of
+`DataStore`, and adding a `Listen*` entry to `interfaces.json`.

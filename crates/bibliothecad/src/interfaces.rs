@@ -22,6 +22,8 @@ pub struct InterfaceFile {
     pub gcs: Option<ListenEntry>,
     #[serde(default)]
     pub icloud: Option<ICloudEntry>,
+    #[serde(default)]
+    pub admin: Option<AdminEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +57,19 @@ pub struct ICloudEntry {
     pub enabled: bool,
     pub listen: String,
     pub container: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminEntry {
+    #[serde(default)]
+    pub enabled: bool,
+    pub listen: String,
+    #[serde(default = "default_admin_group")]
+    pub admin_group: String,
+}
+
+fn default_admin_group() -> String {
+    "admins".to_string()
 }
 
 pub fn load(path: Option<&Path>) -> anyhow::Result<InterfaceFile> {
@@ -206,6 +221,36 @@ pub fn spawn_enabled(svc: BibliothecaService, ifaces: &InterfaceFile) {
                     warn!(error = %e, "icloud interface exited");
                 }
             });
+        }
+    }
+
+    if let Some(cfg) = &ifaces.admin {
+        if cfg.enabled {
+            let svc = svc.clone();
+            let listen = cfg.listen.clone();
+            let admin_group = cfg.admin_group.clone();
+            tokio::spawn(async move {
+                let addr = match listen.parse() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        warn!(error = %e, "invalid admin listen");
+                        return;
+                    }
+                };
+                if let Err(e) = bibliotheca_admin::start(
+                    svc,
+                    bibliotheca_admin::AdminConfig {
+                        listen: addr,
+                        admin_group,
+                    },
+                )
+                .await
+                {
+                    warn!(error = %e, "admin interface exited");
+                }
+            });
+        } else {
+            info!("admin interface present but disabled (default)");
         }
     }
 }

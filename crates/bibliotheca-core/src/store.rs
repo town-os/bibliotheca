@@ -311,6 +311,25 @@ impl Store {
         Ok(v)
     }
 
+    pub fn users_in_group(&self, group: GroupId) -> Result<Vec<UserId>> {
+        let conn = self.inner.lock();
+        let mut stmt =
+            conn.prepare("SELECT user_id FROM group_members WHERE group_id = ?1 ORDER BY user_id")?;
+        let rows = stmt
+            .query_map(params![group.to_string()], |r| {
+                let s: String = r.get(0)?;
+                Ok(s)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut out = Vec::with_capacity(rows.len());
+        for s in rows {
+            if let Ok(uuid) = Uuid::parse_str(&s) {
+                out.push(UserId(uuid));
+            }
+        }
+        Ok(out)
+    }
+
     // ------- subvolumes -------
 
     pub fn create_subvolume(
@@ -631,5 +650,20 @@ mod tests {
         s.add_user_to_group(u.id, g.id).unwrap();
         let groups = s.groups_for_user(u.id).unwrap();
         assert!(groups.contains(&g.id));
+    }
+
+    #[test]
+    fn users_in_group_returns_members() {
+        let s = Store::open_in_memory().unwrap();
+        let alice = s.create_user("alice", "Alice", "h").unwrap();
+        let bob = s.create_user("bob", "Bob", "h").unwrap();
+        let _carol = s.create_user("carol", "Carol", "h").unwrap();
+        let staff = s.create_group("staff", "").unwrap();
+        s.add_user_to_group(alice.id, staff.id).unwrap();
+        s.add_user_to_group(bob.id, staff.id).unwrap();
+        let members = s.users_in_group(staff.id).unwrap();
+        assert_eq!(members.len(), 2);
+        assert!(members.contains(&alice.id));
+        assert!(members.contains(&bob.id));
     }
 }

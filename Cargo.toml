@@ -12,6 +12,7 @@ members = [
     "crates/bibliotheca-nextcloud",
     "crates/bibliotheca-gcs",
     "crates/bibliotheca-icloud",
+    "crates/bibliotheca-admin",
     "crates/bibliothecad",
     "crates/bibliothecactl",
 ]
@@ -35,6 +36,7 @@ bibliotheca-dropbox = { path = "crates/bibliotheca-dropbox" }
 bibliotheca-nextcloud = { path = "crates/bibliotheca-nextcloud" }
 bibliotheca-gcs = { path = "crates/bibliotheca-gcs" }
 bibliotheca-icloud = { path = "crates/bibliotheca-icloud" }
+bibliotheca-admin = { path = "crates/bibliotheca-admin" }
 
 anyhow = "1"
 thiserror = "1"
