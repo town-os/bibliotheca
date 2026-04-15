@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use bibliotheca_config::BibliothecaConfig;
 use bibliotheca_oauth::{run_flow, BrokerParams};
 use bibliotheca_proto::v1::anisette_admin_client::AnisetteAdminClient;
+use bibliotheca_proto::v1::archives_client::ArchivesClient;
 use bibliotheca_proto::v1::identity_client::IdentityClient;
 use bibliotheca_proto::v1::sharing_client::SharingClient;
 use bibliotheca_proto::v1::storage_client::StorageClient;
@@ -68,11 +69,86 @@ enum Cmd {
         #[command(subcommand)]
         cmd: ShareCmd,
     },
+    /// Per-subvolume archival (snapshots or tarballs).
+    Archive {
+        #[command(subcommand)]
+        cmd: ArchiveCmd,
+    },
     /// Embedded anisette proxy.
     Anisette {
         #[command(subcommand)]
         cmd: AnisetteCmd,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum ArchiveCmd {
+    /// Create an archive (snapshot or tarball) for a subvolume.
+    Create {
+        #[arg(long)]
+        subvolume: String,
+        #[arg(long)]
+        name: String,
+        /// Archive kind. "snapshot" is zero-copy via btrfs;
+        /// "tarball" streams every file into a single .tar under
+        /// `archive.root`. Empty → daemon default.
+        #[arg(long, default_value = "")]
+        kind: String,
+        /// Retention window in days. 0 = use daemon default.
+        #[arg(long, default_value_t = 0)]
+        retention_days: u64,
+        #[arg(long, default_value = "")]
+        note: String,
+        #[arg(long)]
+        owner: Option<String>,
+    },
+    List {
+        #[arg(long)]
+        subvolume: Option<String>,
+    },
+    Get {
+        id: String,
+    },
+    Delete {
+        id: String,
+        #[arg(long)]
+        force: bool,
+    },
+    Verify {
+        id: String,
+    },
+    Restore {
+        id: String,
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        overwrite: bool,
+    },
+    Manifest {
+        id: String,
+    },
+    PolicySet {
+        #[arg(long)]
+        subvolume: String,
+        #[arg(long)]
+        kind: String,
+        #[arg(long, default_value_t = 0)]
+        retention_days: u64,
+        #[arg(long, default_value_t = 86400)]
+        interval_secs: u64,
+        #[arg(long, default_value_t = 1)]
+        min_age_days: u64,
+        #[arg(long, default_value_t = true)]
+        enabled: bool,
+    },
+    PolicyGet {
+        subvolume: String,
+    },
+    PolicyDelete {
+        subvolume: String,
+    },
+    PolicyList,
+    LifecycleRun,
 }
 
 #[derive(Debug, Subcommand)]
@@ -551,6 +627,10 @@ async fn main() -> anyhow::Result<()> {
             let mut client = SharingClient::new(channel);
             run_share_cmd(&mut client, cmd).await?;
         }
+        Cmd::Archive { cmd } => {
+            let mut client = ArchivesClient::new(channel);
+            run_archive_cmd(&mut client, cmd).await?;
+        }
     }
 
     Ok(())
@@ -811,6 +891,188 @@ async fn run_share_cmd(
                     key = ev.key,
                 );
             }
+        }
+    }
+    Ok(())
+}
+
+fn print_archive(a: &pb::Archive) {
+    let exp = if a.expires_at == 0 {
+        "never".to_string()
+    } else {
+        a.expires_at.to_string()
+    };
+    println!(
+        "{id}\t{name}\t{kind}\t{size}\t{count}\t{exp}\t{sv}",
+        id = a.id,
+        name = a.name,
+        kind = a.kind,
+        size = a.size_bytes,
+        count = a.object_count,
+        exp = exp,
+        sv = a.subvolume_id,
+    );
+}
+
+fn print_policy(p: &pb::SubvolumePolicy) {
+    let retention = if p.retention_days == 0 {
+        "forever".to_string()
+    } else {
+        format!("{}d", p.retention_days)
+    };
+    println!(
+        "{sv}\t{kind}\tretention={ret}\tinterval={intv}s\tmin_age={min}d\tenabled={enabled}",
+        sv = p.subvolume_id,
+        kind = p.kind,
+        ret = retention,
+        intv = p.archive_interval_secs,
+        min = p.min_age_days,
+        enabled = p.enabled,
+    );
+}
+
+async fn run_archive_cmd(
+    client: &mut ArchivesClient<tonic::transport::Channel>,
+    cmd: ArchiveCmd,
+) -> anyhow::Result<()> {
+    match cmd {
+        ArchiveCmd::Create {
+            subvolume,
+            name,
+            kind,
+            retention_days,
+            note,
+            owner,
+        } => {
+            let resp = client
+                .create_archive(pb::CreateArchiveRequest {
+                    subvolume_id: subvolume,
+                    name,
+                    kind,
+                    retention_days,
+                    note,
+                    created_by: owner.unwrap_or_default(),
+                })
+                .await?
+                .into_inner();
+            print_archive(&resp);
+        }
+        ArchiveCmd::List { subvolume } => {
+            let resp = client
+                .list_archives(pb::ListArchivesRequest {
+                    subvolume_id: subvolume.unwrap_or_default(),
+                })
+                .await?
+                .into_inner();
+            for a in resp.archives {
+                print_archive(&a);
+            }
+        }
+        ArchiveCmd::Get { id } => {
+            let a = client
+                .get_archive(pb::GetArchiveRequest { id })
+                .await?
+                .into_inner();
+            print_archive(&a);
+        }
+        ArchiveCmd::Delete { id, force } => {
+            client
+                .delete_archive(pb::DeleteArchiveRequest { id, force })
+                .await?;
+        }
+        ArchiveCmd::Verify { id } => {
+            let r = client
+                .verify_archive(pb::VerifyArchiveRequest { id })
+                .await?
+                .into_inner();
+            println!(
+                "archive={id}\tok={ok}\ttotal={total}\tchecked={checked}\tmismatches={mm}\tmissing={miss}",
+                id = r.archive_id,
+                ok = r.ok,
+                total = r.total,
+                checked = r.checked,
+                mm = r.mismatches.len(),
+                miss = r.missing.len(),
+            );
+            for m in r.mismatches {
+                println!("mismatch\t{m}");
+            }
+            for m in r.missing {
+                println!("missing\t{m}");
+            }
+        }
+        ArchiveCmd::Restore {
+            id,
+            target,
+            overwrite,
+        } => {
+            let r = client
+                .restore_archive(pb::RestoreArchiveRequest {
+                    id,
+                    target_subvolume_id: target,
+                    overwrite,
+                })
+                .await?
+                .into_inner();
+            println!("restored\t{}", r.restored);
+        }
+        ArchiveCmd::Manifest { id } => {
+            let r = client
+                .get_manifest(pb::ArchiveManifestRequest { id })
+                .await?
+                .into_inner();
+            for e in r.entries {
+                println!("{}\t{}\t{}", e.sha256, e.size, e.key);
+            }
+        }
+        ArchiveCmd::PolicySet {
+            subvolume,
+            kind,
+            retention_days,
+            interval_secs,
+            min_age_days,
+            enabled,
+        } => {
+            let r = client
+                .set_policy(pb::SetSubvolumePolicyRequest {
+                    policy: Some(pb::SubvolumePolicy {
+                        subvolume_id: subvolume,
+                        kind,
+                        retention_days,
+                        archive_interval_secs: interval_secs,
+                        min_age_days,
+                        enabled,
+                        last_run_at: 0,
+                    }),
+                })
+                .await?
+                .into_inner();
+            print_policy(&r);
+        }
+        ArchiveCmd::PolicyGet { subvolume } => {
+            let r = client
+                .get_policy(pb::GetSubvolumePolicyRequest {
+                    subvolume_id: subvolume,
+                })
+                .await?
+                .into_inner();
+            print_policy(&r);
+        }
+        ArchiveCmd::PolicyDelete { subvolume } => {
+            client
+                .delete_policy(pb::DeleteSubvolumePolicyRequest {
+                    subvolume_id: subvolume,
+                })
+                .await?;
+        }
+        ArchiveCmd::PolicyList => {
+            let r = client.list_policies(()).await?.into_inner();
+            for p in r.policies {
+                print_policy(&p);
+            }
+        }
+        ArchiveCmd::LifecycleRun => {
+            client.run_lifecycle_once(()).await?;
         }
     }
     Ok(())

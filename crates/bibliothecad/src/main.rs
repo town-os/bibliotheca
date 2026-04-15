@@ -17,6 +17,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use bibliotheca_archive::ArchiveService;
 use bibliotheca_btrfs::BtrfsBackend;
 use bibliotheca_config::BibliothecaConfig;
 use bibliotheca_core::backend::SubvolumeBackend;
@@ -202,11 +203,20 @@ async fn main() -> anyhow::Result<()> {
         .clone()
         .map(|p| (p, anisette_listen.to_string()));
 
+    // Bring the archive service up. The tarball root is created
+    // on demand so operators don't have to pre-populate it.
+    if let Err(e) = std::fs::create_dir_all(&cfg.archive.root) {
+        tracing::warn!(error = %e, root = %cfg.archive.root.display(), "failed to create archive root");
+    }
+    let archive = Arc::new(ArchiveService::new(svc.clone(), cfg.archive.clone()));
+    archive.clone().spawn_lifecycle(shutdown.clone());
+
     control::serve(
         svc,
         supervisor,
         anisette_for_ctl,
         cfg.share.clone(),
+        Some(archive),
         socket.clone(),
     )
     .await?;

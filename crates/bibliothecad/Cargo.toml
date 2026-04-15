@@ -32,6 +32,7 @@ bibliotheca-sync-gphotos.workspace = true
 bibliotheca-sync-icloud.workspace = true
 bibliotheca-anisette.workspace = true
 bibliotheca-config.workspace = true
+bibliotheca-archive.workspace = true
 
 anyhow.workspace = true
 async-trait.workspace = true

@@ -124,14 +124,7 @@ impl SubvolumeBackend for MemoryBackend {
         if let Some(p) = dest.parent() {
             std::fs::create_dir_all(p)?;
         }
-        std::fs::create_dir(dest)?;
-        // Shallow copy — enough for the assertions we care about.
-        for entry in std::fs::read_dir(source)? {
-            let entry = entry?;
-            if entry.file_type()?.is_file() {
-                std::fs::copy(entry.path(), dest.join(entry.file_name()))?;
-            }
-        }
+        copy_tree(source, dest)?;
         self.inner.lock().ops.push(Op::Snapshot {
             source: source.to_path_buf(),
             dest: dest.to_path_buf(),
@@ -139,6 +132,22 @@ impl SubvolumeBackend for MemoryBackend {
         });
         Ok(())
     }
+}
+
+fn copy_tree(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if ft.is_dir() {
+            copy_tree(&from, &to)?;
+        } else if ft.is_file() {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

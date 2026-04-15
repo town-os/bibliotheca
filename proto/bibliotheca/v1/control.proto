@@ -495,3 +495,105 @@ service Sharing {
   rpc Delete(DeleteShareRequest) returns (google.protobuf.Empty);
   rpc ListEvents(ListShareEventsRequest) returns (ListShareEventsResponse);
 }
+
+// =====================================================================
+// Archives — immutable per-subvolume archives (snapshot or tarball)
+// with retention, verification, and restore. Once created, an
+// archive blocks deletion of the underlying subvolume and any
+// snapshot it references. Operators explicitly drop archives via
+// this service; the daemon also runs a lifecycle task that deletes
+// expired archives and creates fresh ones for subvolumes under
+// policy. See crates/bibliotheca-archive/src/lib.rs for details.
+// =====================================================================
+
+message Archive {
+  string id = 1;
+  string subvolume_id = 2;
+  string name = 3;
+  string kind = 4;                  // "snapshot" | "tarball"
+  string path = 5;
+  uint64 size_bytes = 6;
+  uint64 object_count = 7;
+  string sha256 = 8;
+  google.protobuf.Timestamp created_at = 9;
+  int64 expires_at = 10;            // 0 = never
+  uint64 retention_days = 11;       // 0 = no caller preference
+  bool immutable = 12;
+  string note = 13;
+  string created_by = 14;           // empty = system/lifecycle
+}
+
+message CreateArchiveRequest {
+  string subvolume_id = 1;
+  string name = 2;
+  string kind = 3;                  // empty = use daemon default
+  uint64 retention_days = 4;        // 0 = daemon default / forever
+  string note = 5;
+  string created_by = 6;            // user id, optional
+}
+
+message ListArchivesRequest { string subvolume_id = 1; }
+message ListArchivesResponse { repeated Archive archives = 1; }
+message GetArchiveRequest { string id = 1; }
+message DeleteArchiveRequest {
+  string id = 1;
+  bool force = 2;   // required for immutable=true archives
+}
+
+message VerifyArchiveRequest { string id = 1; }
+message VerifyArchiveResponse {
+  string archive_id = 1;
+  uint64 total = 2;
+  uint64 checked = 3;
+  repeated string mismatches = 4;
+  repeated string missing = 5;
+  bool ok = 6;
+}
+
+message RestoreArchiveRequest {
+  string id = 1;
+  string target_subvolume_id = 2;
+  bool overwrite = 3;
+}
+message RestoreArchiveResponse {
+  uint64 restored = 1;
+}
+
+message SubvolumePolicy {
+  string subvolume_id = 1;
+  string kind = 2;                  // "snapshot" | "tarball"
+  uint64 retention_days = 3;        // 0 = forever
+  uint64 archive_interval_secs = 4;
+  uint64 min_age_days = 5;
+  bool enabled = 6;
+  int64 last_run_at = 7;            // 0 = never
+}
+
+message SetSubvolumePolicyRequest { SubvolumePolicy policy = 1; }
+message GetSubvolumePolicyRequest { string subvolume_id = 1; }
+message DeleteSubvolumePolicyRequest { string subvolume_id = 1; }
+message ListSubvolumePoliciesResponse { repeated SubvolumePolicy policies = 1; }
+
+message ArchiveManifestRequest { string id = 1; }
+message ArchiveManifestEntry {
+  string key = 1;
+  uint64 size = 2;
+  string sha256 = 3;
+}
+message ArchiveManifestResponse { repeated ArchiveManifestEntry entries = 1; }
+
+service Archives {
+  rpc CreateArchive(CreateArchiveRequest) returns (Archive);
+  rpc ListArchives(ListArchivesRequest) returns (ListArchivesResponse);
+  rpc GetArchive(GetArchiveRequest) returns (Archive);
+  rpc DeleteArchive(DeleteArchiveRequest) returns (google.protobuf.Empty);
+  rpc VerifyArchive(VerifyArchiveRequest) returns (VerifyArchiveResponse);
+  rpc RestoreArchive(RestoreArchiveRequest) returns (RestoreArchiveResponse);
+  rpc GetManifest(ArchiveManifestRequest) returns (ArchiveManifestResponse);
+
+  rpc SetPolicy(SetSubvolumePolicyRequest) returns (SubvolumePolicy);
+  rpc GetPolicy(GetSubvolumePolicyRequest) returns (SubvolumePolicy);
+  rpc DeletePolicy(DeleteSubvolumePolicyRequest) returns (google.protobuf.Empty);
+  rpc ListPolicies(google.protobuf.Empty) returns (ListSubvolumePoliciesResponse);
+  rpc RunLifecycleOnce(google.protobuf.Empty) returns (google.protobuf.Empty);
+}

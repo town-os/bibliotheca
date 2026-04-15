@@ -174,6 +174,19 @@ impl BibliothecaService {
                 snaps.len()
             )));
         }
+        // Archive immutability: refuse to drop a subvolume that any
+        // archive still references. The operator must explicitly
+        // delete those archives first (or force-delete them, if
+        // they carry retention) via the archive RPC. This is what
+        // makes "archival" actually mean "you cannot accidentally
+        // lose the data".
+        let archive_count = self.store.count_archives_for_subvolume(id)?;
+        if archive_count > 0 {
+            return Err(Error::InvalidArgument(format!(
+                "subvolume is referenced by {archive_count} immutable archive(s); \
+                 delete them first"
+            )));
+        }
         for snap in snaps {
             let _ = self.backend.delete_subvolume(&snap.mount_path).await;
             let _ = self.store.delete_snapshot(snap.id);
@@ -274,6 +287,27 @@ impl BibliothecaService {
     }
 
     pub async fn delete_snapshot(&self, id: SnapshotId) -> Result<()> {
+        // Refuse to drop a snapshot that a snapshot-kind archive
+        // points at. `delete_snapshot_forced` is the escape hatch
+        // the archive service uses when it is the one holding the
+        // lock.
+        let snap = self.store.get_snapshot(id)?;
+        let archives = self.store.list_archives(Some(snap.subvolume))?;
+        if archives
+            .iter()
+            .any(|a| a.kind == "snapshot" && a.path == snap.mount_path.to_string_lossy())
+        {
+            return Err(Error::InvalidArgument(
+                "snapshot backs an immutable archive; delete the archive first".into(),
+            ));
+        }
+        self.delete_snapshot_forced(id).await
+    }
+
+    /// Internal variant used by the archive service when it owns
+    /// the lifecycle of the underlying snapshot and the immutability
+    /// check would be a false positive.
+    pub async fn delete_snapshot_forced(&self, id: SnapshotId) -> Result<()> {
         let snap = self.store.delete_snapshot(id)?;
         self.backend.delete_subvolume(&snap.mount_path).await?;
         Ok(())

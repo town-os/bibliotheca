@@ -168,6 +168,49 @@ CREATE TABLE IF NOT EXISTS share_events (
 
 CREATE INDEX IF NOT EXISTS share_events_share_ts_idx
     ON share_events(share_id, ts DESC);
+
+CREATE TABLE IF NOT EXISTS archives (
+    id               TEXT PRIMARY KEY,
+    subvolume_id     TEXT NOT NULL REFERENCES subvolumes(id) ON DELETE RESTRICT,
+    name             TEXT NOT NULL,
+    kind             TEXT NOT NULL,          -- 'snapshot' | 'tarball'
+    path             TEXT NOT NULL,          -- snapshot mount path OR tarball file path
+    size_bytes       INTEGER NOT NULL DEFAULT 0,
+    object_count     INTEGER NOT NULL DEFAULT 0,
+    sha256           TEXT NOT NULL DEFAULT '',
+    created_at       INTEGER NOT NULL,
+    expires_at       INTEGER,                -- null = never
+    retention_days   INTEGER,                -- what was requested (informational)
+    immutable        INTEGER NOT NULL DEFAULT 1,
+    note             TEXT NOT NULL DEFAULT '',
+    created_by       TEXT REFERENCES users(id) ON DELETE SET NULL,
+    UNIQUE (subvolume_id, name)
+);
+
+CREATE INDEX IF NOT EXISTS archives_sv_idx
+    ON archives(subvolume_id);
+CREATE INDEX IF NOT EXISTS archives_expires_idx
+    ON archives(expires_at);
+
+CREATE TABLE IF NOT EXISTS archive_manifests (
+    archive_id   TEXT NOT NULL REFERENCES archives(id) ON DELETE CASCADE,
+    key          TEXT NOT NULL,
+    size         INTEGER NOT NULL,
+    sha256       TEXT NOT NULL,
+    PRIMARY KEY (archive_id, key)
+);
+
+CREATE TABLE IF NOT EXISTS subvolume_policies (
+    subvolume_id       TEXT PRIMARY KEY
+                       REFERENCES subvolumes(id) ON DELETE CASCADE,
+    kind               TEXT NOT NULL,          -- 'snapshot' | 'tarball'
+    retention_days     INTEGER,                -- null = archives live forever
+    archive_interval_secs  INTEGER NOT NULL DEFAULT 86400,
+    min_age_days       INTEGER NOT NULL DEFAULT 1,
+    enabled            INTEGER NOT NULL DEFAULT 1,
+    last_run_at        INTEGER,
+    created_at         INTEGER NOT NULL
+);
 "#;
 
 #[derive(Clone)]
@@ -626,6 +669,18 @@ impl Store {
             .query_map(params![subvolume.to_string()], row_to_snapshot)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    pub fn get_snapshot(&self, id: SnapshotId) -> Result<Snapshot> {
+        let conn = self.inner.lock();
+        conn.query_row(
+            "SELECT id, subvolume_id, name, mount_path, readonly, created_at
+             FROM snapshots WHERE id = ?1",
+            params![id.0.to_string()],
+            row_to_snapshot,
+        )
+        .optional()?
+        .ok_or_else(|| Error::NotFound(format!("snapshot {}", id.0)))
     }
 
     pub fn delete_snapshot(&self, id: SnapshotId) -> Result<Snapshot> {
@@ -1192,6 +1247,259 @@ impl Store {
         Ok(rows)
     }
 
+    // ------- archives -------
+
+    pub fn insert_archive(&self, row: &ArchiveRow) -> Result<()> {
+        let conn = self.inner.lock();
+        conn.execute(
+            "INSERT INTO archives
+                (id, subvolume_id, name, kind, path, size_bytes, object_count,
+                 sha256, created_at, expires_at, retention_days, immutable,
+                 note, created_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                row.id,
+                row.subvolume_id,
+                row.name,
+                row.kind,
+                row.path,
+                row.size_bytes,
+                row.object_count,
+                row.sha256,
+                row.created_at,
+                row.expires_at,
+                row.retention_days,
+                row.immutable as i64,
+                row.note,
+                row.created_by,
+            ],
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::SqliteFailure(ref f, _)
+                if f.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                Error::AlreadyExists(format!("archive {}", row.name))
+            }
+            other => other.into(),
+        })?;
+        Ok(())
+    }
+
+    pub fn insert_archive_manifest(
+        &self,
+        archive_id: &str,
+        entries: &[ArchiveEntry],
+    ) -> Result<()> {
+        let mut conn = self.inner.lock();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO archive_manifests (archive_id, key, size, sha256)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for e in entries {
+                stmt.execute(params![archive_id, e.key, e.size as i64, e.sha256])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn list_archive_manifest(&self, archive_id: &str) -> Result<Vec<ArchiveEntry>> {
+        let conn = self.inner.lock();
+        let mut stmt = conn.prepare(
+            "SELECT key, size, sha256 FROM archive_manifests
+             WHERE archive_id = ?1 ORDER BY key",
+        )?;
+        let rows = stmt
+            .query_map(params![archive_id], |r| {
+                Ok(ArchiveEntry {
+                    key: r.get::<_, String>(0)?,
+                    size: r.get::<_, i64>(1)?.max(0) as u64,
+                    sha256: r.get::<_, String>(2)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn get_archive_by_id(&self, id: &str) -> Result<ArchiveRow> {
+        let conn = self.inner.lock();
+        conn.query_row(
+            "SELECT id, subvolume_id, name, kind, path, size_bytes, object_count,
+                    sha256, created_at, expires_at, retention_days, immutable,
+                    note, created_by
+             FROM archives WHERE id = ?1",
+            params![id],
+            row_to_archive,
+        )
+        .optional()?
+        .ok_or_else(|| Error::NotFound(format!("archive {id}")))
+    }
+
+    pub fn get_archive_by_name(&self, subvolume_id: SubvolumeId, name: &str) -> Result<ArchiveRow> {
+        let conn = self.inner.lock();
+        conn.query_row(
+            "SELECT id, subvolume_id, name, kind, path, size_bytes, object_count,
+                    sha256, created_at, expires_at, retention_days, immutable,
+                    note, created_by
+             FROM archives WHERE subvolume_id = ?1 AND name = ?2",
+            params![subvolume_id.to_string(), name],
+            row_to_archive,
+        )
+        .optional()?
+        .ok_or_else(|| Error::NotFound(format!("archive {name}")))
+    }
+
+    pub fn list_archives(&self, subvolume_id: Option<SubvolumeId>) -> Result<Vec<ArchiveRow>> {
+        let conn = self.inner.lock();
+        if let Some(sv) = subvolume_id {
+            let mut stmt = conn.prepare(
+                "SELECT id, subvolume_id, name, kind, path, size_bytes, object_count,
+                        sha256, created_at, expires_at, retention_days, immutable,
+                        note, created_by
+                 FROM archives WHERE subvolume_id = ?1
+                 ORDER BY created_at DESC",
+            )?;
+            let rows = stmt
+                .query_map(params![sv.to_string()], row_to_archive)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT id, subvolume_id, name, kind, path, size_bytes, object_count,
+                        sha256, created_at, expires_at, retention_days, immutable,
+                        note, created_by
+                 FROM archives ORDER BY created_at DESC",
+            )?;
+            let rows = stmt
+                .query_map([], row_to_archive)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        }
+    }
+
+    pub fn count_archives_for_subvolume(&self, subvolume_id: SubvolumeId) -> Result<u64> {
+        let conn = self.inner.lock();
+        let n: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM archives WHERE subvolume_id = ?1",
+            params![subvolume_id.to_string()],
+            |r| r.get(0),
+        )?;
+        Ok(n.max(0) as u64)
+    }
+
+    pub fn delete_archive(&self, id: &str) -> Result<ArchiveRow> {
+        let mut conn = self.inner.lock();
+        let tx = conn.transaction()?;
+        let row: ArchiveRow = tx
+            .query_row(
+                "SELECT id, subvolume_id, name, kind, path, size_bytes, object_count,
+                        sha256, created_at, expires_at, retention_days, immutable,
+                        note, created_by
+                 FROM archives WHERE id = ?1",
+                params![id],
+                row_to_archive,
+            )
+            .optional()?
+            .ok_or_else(|| Error::NotFound(format!("archive {id}")))?;
+        tx.execute("DELETE FROM archives WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(row)
+    }
+
+    pub fn list_expired_archives(&self, now: i64) -> Result<Vec<ArchiveRow>> {
+        let conn = self.inner.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, subvolume_id, name, kind, path, size_bytes, object_count,
+                    sha256, created_at, expires_at, retention_days, immutable,
+                    note, created_by
+             FROM archives
+             WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![now], row_to_archive)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    // ------- subvolume policies -------
+
+    pub fn upsert_subvolume_policy(&self, row: &SubvolumePolicyRow) -> Result<()> {
+        let conn = self.inner.lock();
+        conn.execute(
+            "INSERT INTO subvolume_policies
+                (subvolume_id, kind, retention_days, archive_interval_secs,
+                 min_age_days, enabled, last_run_at, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(subvolume_id) DO UPDATE SET
+                 kind = excluded.kind,
+                 retention_days = excluded.retention_days,
+                 archive_interval_secs = excluded.archive_interval_secs,
+                 min_age_days = excluded.min_age_days,
+                 enabled = excluded.enabled",
+            params![
+                row.subvolume_id,
+                row.kind,
+                row.retention_days,
+                row.archive_interval_secs as i64,
+                row.min_age_days as i64,
+                row.enabled as i64,
+                row.last_run_at,
+                row.created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_subvolume_policy(&self, sv: SubvolumeId) -> Result<Option<SubvolumePolicyRow>> {
+        let conn = self.inner.lock();
+        let row = conn
+            .query_row(
+                "SELECT subvolume_id, kind, retention_days, archive_interval_secs,
+                        min_age_days, enabled, last_run_at, created_at
+                 FROM subvolume_policies WHERE subvolume_id = ?1",
+                params![sv.to_string()],
+                row_to_policy,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn list_subvolume_policies(&self) -> Result<Vec<SubvolumePolicyRow>> {
+        let conn = self.inner.lock();
+        let mut stmt = conn.prepare(
+            "SELECT subvolume_id, kind, retention_days, archive_interval_secs,
+                    min_age_days, enabled, last_run_at, created_at
+             FROM subvolume_policies ORDER BY subvolume_id",
+        )?;
+        let rows = stmt
+            .query_map([], row_to_policy)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn delete_subvolume_policy(&self, sv: SubvolumeId) -> Result<()> {
+        let conn = self.inner.lock();
+        let n = conn.execute(
+            "DELETE FROM subvolume_policies WHERE subvolume_id = ?1",
+            params![sv.to_string()],
+        )?;
+        if n == 0 {
+            return Err(Error::NotFound(format!("policy for {sv}")));
+        }
+        Ok(())
+    }
+
+    pub fn update_subvolume_policy_last_run(&self, sv: SubvolumeId, ts: i64) -> Result<()> {
+        let conn = self.inner.lock();
+        conn.execute(
+            "UPDATE subvolume_policies SET last_run_at = ?1 WHERE subvolume_id = ?2",
+            params![ts, sv.to_string()],
+        )?;
+        Ok(())
+    }
+
     pub fn kv_get(&self, key: &str) -> Result<Option<String>> {
         let conn = self.inner.lock();
         Ok(conn
@@ -1402,6 +1710,75 @@ fn row_to_share_grant(r: &rusqlite::Row<'_>) -> rusqlite::Result<ShareGrantRow> 
         uses: r.get::<_, i64>(8)?,
         revoked: r.get::<_, i64>(9)? != 0,
         note: r.get::<_, String>(10)?,
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct ArchiveRow {
+    pub id: String,
+    pub subvolume_id: String,
+    pub name: String,
+    pub kind: String,
+    pub path: String,
+    pub size_bytes: i64,
+    pub object_count: i64,
+    pub sha256: String,
+    pub created_at: i64,
+    pub expires_at: Option<i64>,
+    pub retention_days: Option<i64>,
+    pub immutable: bool,
+    pub note: String,
+    pub created_by: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ArchiveEntry {
+    pub key: String,
+    pub size: u64,
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SubvolumePolicyRow {
+    pub subvolume_id: String,
+    pub kind: String,
+    pub retention_days: Option<i64>,
+    pub archive_interval_secs: u64,
+    pub min_age_days: u64,
+    pub enabled: bool,
+    pub last_run_at: Option<i64>,
+    pub created_at: i64,
+}
+
+fn row_to_archive(r: &rusqlite::Row<'_>) -> rusqlite::Result<ArchiveRow> {
+    Ok(ArchiveRow {
+        id: r.get::<_, String>(0)?,
+        subvolume_id: r.get::<_, String>(1)?,
+        name: r.get::<_, String>(2)?,
+        kind: r.get::<_, String>(3)?,
+        path: r.get::<_, String>(4)?,
+        size_bytes: r.get::<_, i64>(5)?,
+        object_count: r.get::<_, i64>(6)?,
+        sha256: r.get::<_, String>(7)?,
+        created_at: r.get::<_, i64>(8)?,
+        expires_at: r.get::<_, Option<i64>>(9)?,
+        retention_days: r.get::<_, Option<i64>>(10)?,
+        immutable: r.get::<_, i64>(11)? != 0,
+        note: r.get::<_, String>(12)?,
+        created_by: r.get::<_, Option<String>>(13)?,
+    })
+}
+
+fn row_to_policy(r: &rusqlite::Row<'_>) -> rusqlite::Result<SubvolumePolicyRow> {
+    Ok(SubvolumePolicyRow {
+        subvolume_id: r.get::<_, String>(0)?,
+        kind: r.get::<_, String>(1)?,
+        retention_days: r.get::<_, Option<i64>>(2)?,
+        archive_interval_secs: r.get::<_, i64>(3)?.max(0) as u64,
+        min_age_days: r.get::<_, i64>(4)?.max(0) as u64,
+        enabled: r.get::<_, i64>(5)? != 0,
+        last_run_at: r.get::<_, Option<i64>>(6)?,
+        created_at: r.get::<_, i64>(7)?,
     })
 }
 

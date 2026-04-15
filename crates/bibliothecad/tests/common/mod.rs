@@ -48,6 +48,7 @@ impl Harness {
                 None,
                 None,
                 ShareConfig::default(),
+                None,
                 socket_for_server,
             )
             .await

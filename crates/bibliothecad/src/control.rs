@@ -12,14 +12,19 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 use bibliotheca_anisette::AnisetteProvider;
+use bibliotheca_archive::{
+    Archive as CoreArchive, ArchiveKind, ArchiveService, CreateArchiveParams as ArchiveCreateParams,
+};
 use bibliotheca_config::ShareConfig;
 use bibliotheca_core::acl::{Acl, AclEntry, Permission, Principal};
 use bibliotheca_core::error::Error;
 use bibliotheca_core::identity::{GroupId, UserId};
 use bibliotheca_core::service::BibliothecaService;
 use bibliotheca_core::share::{CreateShareParams, ShareGrant as CoreShareGrant, ShareId};
+use bibliotheca_core::store::SubvolumePolicyRow;
 use bibliotheca_core::subvolume::{SnapshotId, SubvolumeId};
 use bibliotheca_proto::v1::anisette_admin_server::{AnisetteAdmin, AnisetteAdminServer};
+use bibliotheca_proto::v1::archives_server::{Archives, ArchivesServer};
 use bibliotheca_proto::v1::identity_server::{Identity, IdentityServer};
 use bibliotheca_proto::v1::interfaces_server::{Interfaces, InterfacesServer};
 use bibliotheca_proto::v1::ipfs_server::{Ipfs, IpfsServer};
@@ -45,6 +50,7 @@ pub async fn serve(
     supervisor: Option<Arc<Supervisor>>,
     anisette: Option<(Arc<dyn AnisetteProvider>, String)>,
     share_cfg: ShareConfig,
+    archive: Option<Arc<ArchiveService>>,
     socket: PathBuf,
 ) -> anyhow::Result<()> {
     if socket.exists() {
@@ -65,6 +71,9 @@ pub async fn serve(
         svc: svc.clone(),
         cfg: share_cfg,
     };
+    let archives_svc = ArchivesSvc {
+        archive: archive.clone(),
+    };
     let anisette_admin = AnisetteAdminSvc { provider: anisette };
 
     Server::builder()
@@ -74,6 +83,7 @@ pub async fn serve(
         .add_service(IpfsServer::new(ipfs))
         .add_service(SyncAdminServer::new(sync))
         .add_service(SharingServer::new(sharing))
+        .add_service(ArchivesServer::new(archives_svc))
         .add_service(AnisetteAdminServer::new(anisette_admin))
         .serve_with_incoming(stream)
         .await?;
@@ -1192,6 +1202,279 @@ impl Sharing for SharingSvc {
             })
             .collect();
         Ok(Response::new(pb::ListShareEventsResponse { events }))
+    }
+}
+
+// ---------- Archives ----------
+
+pub struct ArchivesSvc {
+    archive: Option<Arc<ArchiveService>>,
+}
+
+impl ArchivesSvc {
+    fn require(&self) -> Result<&Arc<ArchiveService>, Status> {
+        self.archive
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("archive subsystem disabled"))
+    }
+}
+
+fn archive_err(e: bibliotheca_archive::Error) -> Status {
+    use bibliotheca_archive::Error as E;
+    match e {
+        E::Core(c) => to_status(c),
+        E::UnsupportedKind(m) => Status::invalid_argument(m),
+        E::Immutable(m) => Status::failed_precondition(m),
+        E::VerifyFailed { archive, reason } => Status::data_loss(format!("{archive}: {reason}")),
+        E::RestoreConflict(m) => Status::already_exists(m),
+        E::Io(e) => Status::internal(e.to_string()),
+        E::Other(m) => Status::internal(m),
+    }
+}
+
+fn archive_to_pb(a: &CoreArchive) -> pb::Archive {
+    pb::Archive {
+        id: a.id.clone(),
+        subvolume_id: a.subvolume_id.to_string(),
+        name: a.name.clone(),
+        kind: a.kind.as_str().to_string(),
+        path: a.path.to_string_lossy().into_owned(),
+        size_bytes: a.size_bytes,
+        object_count: a.object_count,
+        sha256: a.sha256.clone(),
+        created_at: Some(ts(a.created_at)),
+        expires_at: a.expires_at.map(|t| t.unix_timestamp()).unwrap_or(0),
+        retention_days: a.retention_days.unwrap_or(0),
+        immutable: a.immutable,
+        note: a.note.clone(),
+        created_by: a.created_by.map(|u| u.to_string()).unwrap_or_default(),
+    }
+}
+
+fn policy_to_pb(row: &SubvolumePolicyRow) -> pb::SubvolumePolicy {
+    pb::SubvolumePolicy {
+        subvolume_id: row.subvolume_id.clone(),
+        kind: row.kind.clone(),
+        retention_days: row.retention_days.map(|d| d.max(0) as u64).unwrap_or(0),
+        archive_interval_secs: row.archive_interval_secs,
+        min_age_days: row.min_age_days,
+        enabled: row.enabled,
+        last_run_at: row.last_run_at.unwrap_or(0),
+    }
+}
+
+fn policy_from_pb(pb: pb::SubvolumePolicy) -> Result<SubvolumePolicyRow, Status> {
+    // Validate subvolume id is parseable as a uuid even if we store it
+    // as text — saves confusion later when the lifecycle task runs.
+    let _ =
+        Uuid::parse_str(&pb.subvolume_id).map_err(|_| Status::invalid_argument("subvolume_id"))?;
+    if pb.kind != "snapshot" && pb.kind != "tarball" {
+        return Err(Status::invalid_argument("kind must be snapshot or tarball"));
+    }
+    Ok(SubvolumePolicyRow {
+        subvolume_id: pb.subvolume_id,
+        kind: pb.kind,
+        retention_days: if pb.retention_days == 0 {
+            None
+        } else {
+            Some(pb.retention_days as i64)
+        },
+        archive_interval_secs: pb.archive_interval_secs.max(60),
+        min_age_days: pb.min_age_days,
+        enabled: pb.enabled,
+        last_run_at: if pb.last_run_at == 0 {
+            None
+        } else {
+            Some(pb.last_run_at)
+        },
+        created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+    })
+}
+
+#[tonic::async_trait]
+impl Archives for ArchivesSvc {
+    async fn create_archive(
+        &self,
+        req: Request<pb::CreateArchiveRequest>,
+    ) -> Result<Response<pb::Archive>, Status> {
+        let svc = self.require()?;
+        let r = req.into_inner();
+        let sv_uuid = Uuid::parse_str(&r.subvolume_id)
+            .map_err(|_| Status::invalid_argument("subvolume_id"))?;
+        let kind_str = if r.kind.is_empty() {
+            svc.config().default_kind.clone()
+        } else {
+            r.kind
+        };
+        let kind = ArchiveKind::parse(&kind_str).map_err(archive_err)?;
+        let created_by = if r.created_by.is_empty() {
+            None
+        } else {
+            Some(parse_user_id(&r.created_by)?)
+        };
+        let retention = if r.retention_days == 0 {
+            None
+        } else {
+            Some(r.retention_days)
+        };
+        let archive = svc
+            .create(ArchiveCreateParams {
+                subvolume_id: SubvolumeId(sv_uuid),
+                name: r.name,
+                kind,
+                retention_days: retention,
+                note: r.note,
+                created_by,
+            })
+            .await
+            .map_err(archive_err)?;
+        Ok(Response::new(archive_to_pb(&archive)))
+    }
+
+    async fn list_archives(
+        &self,
+        req: Request<pb::ListArchivesRequest>,
+    ) -> Result<Response<pb::ListArchivesResponse>, Status> {
+        let svc = self.require()?;
+        let r = req.into_inner();
+        let sv = if r.subvolume_id.is_empty() {
+            None
+        } else {
+            Some(SubvolumeId(
+                Uuid::parse_str(&r.subvolume_id)
+                    .map_err(|_| Status::invalid_argument("subvolume_id"))?,
+            ))
+        };
+        let list = svc.list(sv).map_err(archive_err)?;
+        Ok(Response::new(pb::ListArchivesResponse {
+            archives: list.iter().map(archive_to_pb).collect(),
+        }))
+    }
+
+    async fn get_archive(
+        &self,
+        req: Request<pb::GetArchiveRequest>,
+    ) -> Result<Response<pb::Archive>, Status> {
+        let svc = self.require()?;
+        let id = req.into_inner().id;
+        let archive = svc.get(&id).map_err(archive_err)?;
+        Ok(Response::new(archive_to_pb(&archive)))
+    }
+
+    async fn delete_archive(
+        &self,
+        req: Request<pb::DeleteArchiveRequest>,
+    ) -> Result<Response<()>, Status> {
+        let svc = self.require()?;
+        let r = req.into_inner();
+        svc.delete(&r.id, r.force).await.map_err(archive_err)?;
+        Ok(Response::new(()))
+    }
+
+    async fn verify_archive(
+        &self,
+        req: Request<pb::VerifyArchiveRequest>,
+    ) -> Result<Response<pb::VerifyArchiveResponse>, Status> {
+        let svc = self.require()?;
+        let r = req.into_inner();
+        let report = svc.verify(&r.id).map_err(archive_err)?;
+        Ok(Response::new(pb::VerifyArchiveResponse {
+            archive_id: report.archive_id,
+            total: report.total,
+            checked: report.checked,
+            ok: report.mismatches.is_empty() && report.missing.is_empty(),
+            mismatches: report.mismatches,
+            missing: report.missing,
+        }))
+    }
+
+    async fn restore_archive(
+        &self,
+        req: Request<pb::RestoreArchiveRequest>,
+    ) -> Result<Response<pb::RestoreArchiveResponse>, Status> {
+        let svc = self.require()?;
+        let r = req.into_inner();
+        let target = Uuid::parse_str(&r.target_subvolume_id)
+            .map_err(|_| Status::invalid_argument("target_subvolume_id"))?;
+        let n = svc
+            .restore(&r.id, SubvolumeId(target), r.overwrite)
+            .map_err(archive_err)?;
+        Ok(Response::new(pb::RestoreArchiveResponse { restored: n }))
+    }
+
+    async fn get_manifest(
+        &self,
+        req: Request<pb::ArchiveManifestRequest>,
+    ) -> Result<Response<pb::ArchiveManifestResponse>, Status> {
+        let svc = self.require()?;
+        let id = req.into_inner().id;
+        let entries = svc.manifest(&id).map_err(archive_err)?;
+        Ok(Response::new(pb::ArchiveManifestResponse {
+            entries: entries
+                .into_iter()
+                .map(|e| pb::ArchiveManifestEntry {
+                    key: e.key,
+                    size: e.size,
+                    sha256: e.sha256,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn set_policy(
+        &self,
+        req: Request<pb::SetSubvolumePolicyRequest>,
+    ) -> Result<Response<pb::SubvolumePolicy>, Status> {
+        let svc = self.require()?;
+        let pb_policy = req
+            .into_inner()
+            .policy
+            .ok_or_else(|| Status::invalid_argument("missing policy"))?;
+        let row = policy_from_pb(pb_policy)?;
+        svc.set_policy(row.clone()).map_err(archive_err)?;
+        Ok(Response::new(policy_to_pb(&row)))
+    }
+
+    async fn get_policy(
+        &self,
+        req: Request<pb::GetSubvolumePolicyRequest>,
+    ) -> Result<Response<pb::SubvolumePolicy>, Status> {
+        let svc = self.require()?;
+        let sv = Uuid::parse_str(&req.into_inner().subvolume_id)
+            .map_err(|_| Status::invalid_argument("subvolume_id"))?;
+        let row = svc
+            .get_policy(SubvolumeId(sv))
+            .map_err(archive_err)?
+            .ok_or_else(|| Status::not_found("policy"))?;
+        Ok(Response::new(policy_to_pb(&row)))
+    }
+
+    async fn delete_policy(
+        &self,
+        req: Request<pb::DeleteSubvolumePolicyRequest>,
+    ) -> Result<Response<()>, Status> {
+        let svc = self.require()?;
+        let sv = Uuid::parse_str(&req.into_inner().subvolume_id)
+            .map_err(|_| Status::invalid_argument("subvolume_id"))?;
+        svc.delete_policy(SubvolumeId(sv)).map_err(archive_err)?;
+        Ok(Response::new(()))
+    }
+
+    async fn list_policies(
+        &self,
+        _req: Request<()>,
+    ) -> Result<Response<pb::ListSubvolumePoliciesResponse>, Status> {
+        let svc = self.require()?;
+        let rows = svc.list_policies().map_err(archive_err)?;
+        Ok(Response::new(pb::ListSubvolumePoliciesResponse {
+            policies: rows.iter().map(policy_to_pb).collect(),
+        }))
+    }
+
+    async fn run_lifecycle_once(&self, _req: Request<()>) -> Result<Response<()>, Status> {
+        let svc = self.require()?;
+        svc.run_lifecycle_once().await.map_err(archive_err)?;
+        Ok(Response::new(()))
     }
 }
 

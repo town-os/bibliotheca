@@ -24,6 +24,7 @@ members = [
     "crates/bibliotheca-anisette",
     "crates/bibliotheca-config",
     "crates/bibliotheca-oauth",
+    "crates/bibliotheca-archive",
     "crates/bibliothecad",
     "crates/bibliothecactl",
 ]
@@ -59,6 +60,7 @@ bibliotheca-sync-icloud = { path = "crates/bibliotheca-sync-icloud" }
 bibliotheca-anisette = { path = "crates/bibliotheca-anisette" }
 bibliotheca-config = { path = "crates/bibliotheca-config" }
 bibliotheca-oauth = { path = "crates/bibliotheca-oauth" }
+bibliotheca-archive = { path = "crates/bibliotheca-archive" }
 
 anyhow = "1"
 thiserror = "1"
