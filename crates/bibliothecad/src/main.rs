@@ -137,7 +137,12 @@ async fn main() -> anyhow::Result<()> {
     let svc = BibliothecaService::new(store.clone(), backend);
 
     let ifaces = interfaces::load(interfaces_path.as_deref())?;
-    interfaces::spawn_enabled(svc.clone(), &ifaces);
+    // Whether the authenticated HTTP interface should additionally
+    // mount the anonymous share-link routes. For now this is on
+    // whenever HTTP itself is enabled; a dedicated flag can be
+    // added later if some operators want shares disabled.
+    let share_enabled_on_http = ifaces.http.as_ref().map(|h| h.enabled).unwrap_or(false);
+    interfaces::spawn_enabled(svc.clone(), &ifaces, share_enabled_on_http);
 
     let shutdown = CancellationToken::new();
     let supervisor = sync::boot(
@@ -197,7 +202,14 @@ async fn main() -> anyhow::Result<()> {
         .clone()
         .map(|p| (p, anisette_listen.to_string()));
 
-    control::serve(svc, supervisor, anisette_for_ctl, socket.clone()).await?;
+    control::serve(
+        svc,
+        supervisor,
+        anisette_for_ctl,
+        cfg.share.clone(),
+        socket.clone(),
+    )
+    .await?;
     shutdown.cancel();
     info!("bibliothecad shutting down");
     Ok(())

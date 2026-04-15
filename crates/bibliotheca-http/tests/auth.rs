@@ -40,6 +40,7 @@ async fn spawn(allow_public: bool) -> Harness {
             HttpConfig {
                 listen: addr,
                 allow_public,
+                share_enabled: false,
             },
         )
         .await;

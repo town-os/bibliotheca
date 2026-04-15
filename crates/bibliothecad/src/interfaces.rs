@@ -95,7 +95,7 @@ pub fn load(path: Option<&Path>) -> anyhow::Result<InterfaceFile> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-pub fn spawn_enabled(svc: BibliothecaService, ifaces: &InterfaceFile) {
+pub fn spawn_enabled(svc: BibliothecaService, ifaces: &InterfaceFile, share_enabled: bool) {
     if let Some(http) = &ifaces.http {
         if http.enabled {
             let svc = svc.clone();
@@ -114,6 +114,7 @@ pub fn spawn_enabled(svc: BibliothecaService, ifaces: &InterfaceFile) {
                     bibliotheca_http::HttpConfig {
                         listen: addr,
                         allow_public,
+                        share_enabled,
                     },
                 )
                 .await

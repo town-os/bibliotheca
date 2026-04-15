@@ -8,10 +8,12 @@ use tracing::{info, warn};
 
 use crate::acl::{Acl, Permission};
 use crate::backend::SubvolumeBackend;
+use crate::data::resolve_key;
 use crate::error::{Error, Result};
 use crate::identity::{Group, GroupId, User, UserId};
 use crate::password;
-use crate::store::Store;
+use crate::share::{CreateShareParams, ShareGrant, ShareId};
+use crate::store::{ShareEventRow, ShareGrantRow, Store};
 use crate::subvolume::{Snapshot, SnapshotId, Subvolume, SubvolumeId};
 
 #[derive(Clone)]
@@ -288,5 +290,184 @@ impl BibliothecaService {
     ) -> Result<bool> {
         self.store
             .check_permission(sv, user, wanted, public_allowed)
+    }
+
+    // ---- share grants ----
+
+    pub fn create_share(&self, params: CreateShareParams, token: String) -> Result<ShareGrant> {
+        // Validate that the subvolume exists.
+        let sv = self.store.get_subvolume(params.subvolume_id)?;
+        // If a specific key was requested, make sure it actually
+        // resolves inside the mount and points at a file. That
+        // keeps bogus tokens out of the DB and gives the operator
+        // an immediate error instead of a 404 on first use.
+        if let Some(ref k) = params.key {
+            let abs = resolve_key(&sv.mount_path, k)?;
+            if !abs.exists() {
+                return Err(Error::NotFound(format!("{}/{}", sv.name, k)));
+            }
+        }
+        let id = ShareId::new();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let row = ShareGrantRow {
+            id: id.to_string(),
+            token,
+            subvolume_id: sv.id.to_string(),
+            key: params.key.clone().unwrap_or_default(),
+            created_by: params.created_by.to_string(),
+            created_at: now,
+            expires_at: params.expires_at.map(|t| t.unix_timestamp()),
+            use_limit: params.use_limit.map(|n| n as i64),
+            uses: 0,
+            revoked: false,
+            note: params.note,
+        };
+        self.store.insert_share_grant(&row)?;
+        let _ = self.store.insert_share_event(&ShareEventRow {
+            id: 0,
+            share_id: row.id.clone(),
+            ts: now,
+            action: "create".into(),
+            remote_ip: String::new(),
+            user_agent: String::new(),
+            key: row.key.clone(),
+            status: 201,
+        });
+        ShareGrant::from_row(row)
+    }
+
+    pub fn list_shares(&self, sv: Option<SubvolumeId>) -> Result<Vec<ShareGrant>> {
+        self.store
+            .list_share_grants(sv)?
+            .into_iter()
+            .map(ShareGrant::from_row)
+            .collect()
+    }
+
+    pub fn get_share(&self, id: ShareId) -> Result<ShareGrant> {
+        let row = self.store.get_share_grant_by_id(&id.to_string())?;
+        ShareGrant::from_row(row)
+    }
+
+    pub fn get_share_by_token(&self, token: &str) -> Result<ShareGrant> {
+        let row = self.store.get_share_grant_by_token(token)?;
+        ShareGrant::from_row(row)
+    }
+
+    pub fn revoke_share(&self, id: ShareId) -> Result<()> {
+        self.store.revoke_share_grant(&id.to_string())?;
+        let _ = self.store.insert_share_event(&ShareEventRow {
+            id: 0,
+            share_id: id.to_string(),
+            ts: time::OffsetDateTime::now_utc().unix_timestamp(),
+            action: "revoke".into(),
+            remote_ip: String::new(),
+            user_agent: String::new(),
+            key: String::new(),
+            status: 200,
+        });
+        Ok(())
+    }
+
+    /// Called by the HTTP share handler on every successful GET.
+    /// Atomically validates the token and increments `uses`; records
+    /// an audit event regardless of outcome.
+    pub fn consume_share(
+        &self,
+        token: &str,
+        key: &str,
+        remote_ip: &str,
+        user_agent: &str,
+    ) -> Result<ShareGrant> {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        match self.store.consume_share_use(token, now) {
+            Ok(row) => {
+                let grant = ShareGrant::from_row(row)?;
+                let _ = self.store.insert_share_event(&ShareEventRow {
+                    id: 0,
+                    share_id: grant.id.to_string(),
+                    ts: now,
+                    action: "use".into(),
+                    remote_ip: remote_ip.to_string(),
+                    user_agent: user_agent.to_string(),
+                    key: key.to_string(),
+                    status: 200,
+                });
+                Ok(grant)
+            }
+            Err(e) => {
+                // Best-effort audit write. If we can't find the
+                // token at all, there's nothing to attach the
+                // event to — silently drop it.
+                if let Ok(existing) = self.store.get_share_grant_by_token(token) {
+                    let action = match &e {
+                        Error::InvalidArgument(m) if m.contains("expired") => "expire",
+                        Error::InvalidArgument(m) if m.contains("exhausted") => "deny",
+                        Error::PermissionDenied => "deny",
+                        _ => "deny",
+                    };
+                    let status = match &e {
+                        Error::InvalidArgument(m) if m.contains("expired") => 410,
+                        Error::InvalidArgument(m) if m.contains("exhausted") => 429,
+                        Error::PermissionDenied => 403,
+                        _ => 500,
+                    };
+                    let _ = self.store.insert_share_event(&ShareEventRow {
+                        id: 0,
+                        share_id: existing.id,
+                        ts: now,
+                        action: action.into(),
+                        remote_ip: remote_ip.to_string(),
+                        user_agent: user_agent.to_string(),
+                        key: key.to_string(),
+                        status,
+                    });
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Read bytes on behalf of a share token, bypassing the usual
+    /// ACL evaluation. Path traversal is still enforced through
+    /// `resolve_key`; if the share pins a specific key, the caller
+    /// must use that exact key or pass an empty string (both map to
+    /// the pinned key). Otherwise the caller supplies the full key.
+    pub fn read_shared_object(
+        &self,
+        grant: &ShareGrant,
+        requested_key: &str,
+    ) -> Result<(String, Vec<u8>)> {
+        let sv = self.store.get_subvolume(grant.subvolume_id)?;
+        let effective_key = match (&grant.key, requested_key) {
+            (Some(pinned), "") => pinned.clone(),
+            (Some(pinned), req) if req == pinned => pinned.clone(),
+            (Some(_), _) => {
+                return Err(Error::PermissionDenied);
+            }
+            (None, "") => {
+                return Err(Error::InvalidArgument(
+                    "share covers whole subvolume, key required in URL".into(),
+                ));
+            }
+            (None, req) => req.to_string(),
+        };
+        let abs = resolve_key(&sv.mount_path, &effective_key)?;
+        if !abs.exists() {
+            return Err(Error::NotFound(format!("{}/{}", sv.name, effective_key)));
+        }
+        if abs.is_dir() {
+            return Err(Error::InvalidArgument("target is a directory".into()));
+        }
+        let bytes = std::fs::read(&abs)?;
+        Ok((effective_key, bytes))
+    }
+
+    pub fn recent_share_events(
+        &self,
+        id: ShareId,
+        limit: u32,
+    ) -> Result<Vec<crate::store::ShareEventRow>> {
+        self.store.recent_share_events(&id.to_string(), limit)
     }
 }

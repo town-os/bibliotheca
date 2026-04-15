@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bibliotheca_config::ShareConfig;
 use bibliotheca_core::backend::SubvolumeBackend;
 use bibliotheca_core::service::BibliothecaService;
 use bibliotheca_core::store::Store;
@@ -42,7 +43,14 @@ impl Harness {
         let svc_for_server = svc.clone();
         let socket_for_server = socket.clone();
         let server = tokio::spawn(async move {
-            bibliothecad::control::serve(svc_for_server, None, None, socket_for_server).await
+            bibliothecad::control::serve(
+                svc_for_server,
+                None,
+                None,
+                ShareConfig::default(),
+                socket_for_server,
+            )
+            .await
         });
 
         // Wait until the socket appears, with a hard ceiling so a

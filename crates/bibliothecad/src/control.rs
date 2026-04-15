@@ -10,16 +10,20 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use base64::Engine as _;
 use bibliotheca_anisette::AnisetteProvider;
+use bibliotheca_config::ShareConfig;
 use bibliotheca_core::acl::{Acl, AclEntry, Permission, Principal};
 use bibliotheca_core::error::Error;
 use bibliotheca_core::identity::{GroupId, UserId};
 use bibliotheca_core::service::BibliothecaService;
+use bibliotheca_core::share::{CreateShareParams, ShareGrant as CoreShareGrant, ShareId};
 use bibliotheca_core::subvolume::{SnapshotId, SubvolumeId};
 use bibliotheca_proto::v1::anisette_admin_server::{AnisetteAdmin, AnisetteAdminServer};
 use bibliotheca_proto::v1::identity_server::{Identity, IdentityServer};
 use bibliotheca_proto::v1::interfaces_server::{Interfaces, InterfacesServer};
 use bibliotheca_proto::v1::ipfs_server::{Ipfs, IpfsServer};
+use bibliotheca_proto::v1::sharing_server::{Sharing, SharingServer};
 use bibliotheca_proto::v1::storage_server::{Storage, StorageServer};
 use bibliotheca_proto::v1::sync_admin_server::{SyncAdmin, SyncAdminServer};
 use bibliotheca_proto::v1::{self as pb};
@@ -28,6 +32,8 @@ use bibliotheca_sync_core::{
 };
 use futures::Stream;
 use prost_types::Timestamp;
+use rand::RngCore;
+use time::OffsetDateTime;
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::{transport::Server, Request, Response, Status};
@@ -38,6 +44,7 @@ pub async fn serve(
     svc: BibliothecaService,
     supervisor: Option<Arc<Supervisor>>,
     anisette: Option<(Arc<dyn AnisetteProvider>, String)>,
+    share_cfg: ShareConfig,
     socket: PathBuf,
 ) -> anyhow::Result<()> {
     if socket.exists() {
@@ -50,9 +57,13 @@ pub async fn serve(
     let identity = IdentitySvc { svc: svc.clone() };
     let storage = StorageSvc { svc: svc.clone() };
     let interfaces = InterfacesSvc {};
-    let ipfs = IpfsSvc { svc };
+    let ipfs = IpfsSvc { svc: svc.clone() };
     let sync = SyncAdminSvc {
         supervisor: supervisor.clone(),
+    };
+    let sharing = SharingSvc {
+        svc: svc.clone(),
+        cfg: share_cfg,
     };
     let anisette_admin = AnisetteAdminSvc { provider: anisette };
 
@@ -62,6 +73,7 @@ pub async fn serve(
         .add_service(InterfacesServer::new(interfaces))
         .add_service(IpfsServer::new(ipfs))
         .add_service(SyncAdminServer::new(sync))
+        .add_service(SharingServer::new(sharing))
         .add_service(AnisetteAdminServer::new(anisette_admin))
         .serve_with_incoming(stream)
         .await?;
@@ -992,6 +1004,194 @@ impl SyncAdmin for SyncAdminSvc {
             .map_err(sync_err)?;
         info!(rotated = n, "sync secret key rotated");
         Ok(Response::new(()))
+    }
+}
+
+// ---------- Sharing ----------
+
+pub struct SharingSvc {
+    svc: BibliothecaService,
+    cfg: ShareConfig,
+}
+
+impl SharingSvc {
+    fn mint_token(&self) -> String {
+        let bytes = self.cfg.token_bytes.clamp(16, 128);
+        let mut buf = vec![0u8; bytes];
+        rand::thread_rng().fill_bytes(&mut buf);
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&buf)
+    }
+
+    fn resolve_ttl(&self, requested: u64) -> Result<Option<OffsetDateTime>, Status> {
+        let effective = if requested > 0 {
+            Some(requested)
+        } else {
+            self.cfg.default_ttl_secs
+        };
+        let Some(secs) = effective else {
+            return Ok(None);
+        };
+        if let Some(max) = self.cfg.max_ttl_secs {
+            if secs > max {
+                return Err(Status::invalid_argument(format!(
+                    "ttl_secs={secs} exceeds daemon max of {max}"
+                )));
+            }
+        }
+        let exp = OffsetDateTime::now_utc() + time::Duration::seconds(secs as i64);
+        Ok(Some(exp))
+    }
+
+    fn resolve_use_limit(&self, requested: u64) -> Option<u64> {
+        if requested > 0 {
+            Some(requested)
+        } else {
+            self.cfg.default_use_limit
+        }
+    }
+
+    fn build_url(&self, token: &str) -> String {
+        match &self.cfg.base_url {
+            Some(base) => {
+                let base = base.as_str().trim_end_matches('/');
+                format!("{base}/s/{token}")
+            }
+            None => String::new(),
+        }
+    }
+}
+
+fn share_grant_to_pb(g: &CoreShareGrant) -> pb::ShareGrant {
+    pb::ShareGrant {
+        id: g.id.to_string(),
+        token: g.token.clone(),
+        subvolume_id: g.subvolume_id.to_string(),
+        key: g.key.clone().unwrap_or_default(),
+        created_by: g.created_by.to_string(),
+        created_at: Some(ts(g.created_at)),
+        expires_at: g.expires_at.map(|t| t.unix_timestamp()).unwrap_or(0),
+        use_limit: g.use_limit.unwrap_or(0),
+        uses: g.uses,
+        revoked: g.revoked,
+        note: g.note.clone(),
+    }
+}
+
+fn parse_share_id(s: &str) -> Result<ShareId, Status> {
+    Uuid::parse_str(s)
+        .map(ShareId)
+        .map_err(|_| Status::invalid_argument("share id"))
+}
+
+#[tonic::async_trait]
+impl Sharing for SharingSvc {
+    async fn create(
+        &self,
+        req: Request<pb::CreateShareRequest>,
+    ) -> Result<Response<pb::CreateShareResponse>, Status> {
+        let r = req.into_inner();
+        let sv = if let Ok(uuid) = Uuid::parse_str(&r.subvolume_id) {
+            self.svc
+                .get_subvolume(&uuid.to_string())
+                .map_err(to_status)?
+        } else {
+            self.svc.get_subvolume(&r.subvolume_id).map_err(to_status)?
+        };
+        let owner = parse_user_id(&r.created_by)?;
+        let expires = self.resolve_ttl(r.ttl_secs)?;
+        let use_limit = self.resolve_use_limit(r.use_limit);
+        let token = self.mint_token();
+        let params = CreateShareParams {
+            subvolume_id: sv.id,
+            created_by: owner,
+            key: if r.key.is_empty() { None } else { Some(r.key) },
+            expires_at: expires,
+            use_limit,
+            note: r.note,
+        };
+        let grant = self
+            .svc
+            .create_share(params, token.clone())
+            .map_err(to_status)?;
+        let url = self.build_url(&token);
+        Ok(Response::new(pb::CreateShareResponse {
+            grant: Some(share_grant_to_pb(&grant)),
+            url,
+        }))
+    }
+
+    async fn list(
+        &self,
+        req: Request<pb::ListSharesRequest>,
+    ) -> Result<Response<pb::ListSharesResponse>, Status> {
+        let r = req.into_inner();
+        let sv = if r.subvolume_id.is_empty() {
+            None
+        } else {
+            let s = self.svc.get_subvolume(&r.subvolume_id).map_err(to_status)?;
+            Some(s.id)
+        };
+        let grants = self.svc.list_shares(sv).map_err(to_status)?;
+        Ok(Response::new(pb::ListSharesResponse {
+            grants: grants.iter().map(share_grant_to_pb).collect(),
+        }))
+    }
+
+    async fn get(
+        &self,
+        req: Request<pb::GetShareRequest>,
+    ) -> Result<Response<pb::ShareGrant>, Status> {
+        let s = req.into_inner().id_or_token;
+        let grant = if let Ok(uuid) = Uuid::parse_str(&s) {
+            self.svc.get_share(ShareId(uuid)).map_err(to_status)?
+        } else {
+            self.svc.get_share_by_token(&s).map_err(to_status)?
+        };
+        Ok(Response::new(share_grant_to_pb(&grant)))
+    }
+
+    async fn revoke(&self, req: Request<pb::RevokeShareRequest>) -> Result<Response<()>, Status> {
+        let id = parse_share_id(&req.into_inner().id)?;
+        self.svc.revoke_share(id).map_err(to_status)?;
+        Ok(Response::new(()))
+    }
+
+    async fn delete(&self, req: Request<pb::DeleteShareRequest>) -> Result<Response<()>, Status> {
+        let id = parse_share_id(&req.into_inner().id)?;
+        self.svc
+            .store()
+            .delete_share_grant(&id.to_string())
+            .map_err(to_status)?;
+        Ok(Response::new(()))
+    }
+
+    async fn list_events(
+        &self,
+        req: Request<pb::ListShareEventsRequest>,
+    ) -> Result<Response<pb::ListShareEventsResponse>, Status> {
+        let r = req.into_inner();
+        let id = parse_share_id(&r.id)?;
+        let rows = self
+            .svc
+            .recent_share_events(id, r.limit)
+            .map_err(to_status)?;
+        let events = rows
+            .into_iter()
+            .map(|row| pb::ShareEvent {
+                id: row.id,
+                share_id: row.share_id,
+                ts: Some(Timestamp {
+                    seconds: row.ts,
+                    nanos: 0,
+                }),
+                action: row.action,
+                remote_ip: row.remote_ip,
+                user_agent: row.user_agent,
+                key: row.key,
+                status: row.status,
+            })
+            .collect();
+        Ok(Response::new(pb::ListShareEventsResponse { events }))
     }
 }
 

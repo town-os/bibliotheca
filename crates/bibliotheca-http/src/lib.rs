@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
@@ -34,6 +34,7 @@ struct AppState {
     data: DataStore,
     svc: BibliothecaService,
     public_allowed: bool,
+    share_enabled: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +43,11 @@ pub struct HttpConfig {
     /// Honour ACL entries with `Principal::Public`. Requires the
     /// interface to be enabled in the first place.
     pub allow_public: bool,
+    /// Serve `/s/:token/...` routes that resolve anonymous share
+    /// links against the control-plane share store. Off by default
+    /// so operators who don't want share links served via the
+    /// authenticated HTTP interface don't get them.
+    pub share_enabled: bool,
 }
 
 pub async fn start(svc: BibliothecaService, cfg: HttpConfig) -> anyhow::Result<()> {
@@ -49,9 +55,10 @@ pub async fn start(svc: BibliothecaService, cfg: HttpConfig) -> anyhow::Result<(
         data: DataStore::new(svc.clone()),
         svc,
         public_allowed: cfg.allow_public,
+        share_enabled: cfg.share_enabled,
     };
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/v1/subvolumes/:sv/objects", get(list_root))
         .route("/v1/subvolumes/:sv/objects/", get(list_root))
@@ -61,14 +68,24 @@ pub async fn start(svc: BibliothecaService, cfg: HttpConfig) -> anyhow::Result<(
                 .put(put_object)
                 .delete(delete_object)
                 .head(head_object),
-        )
-        .with_state(Arc::new(state));
+        );
+    if cfg.share_enabled {
+        app = app
+            .route("/s/:token", get(share_get_root))
+            .route("/s/:token/", get(share_get_root))
+            .route("/s/:token/*key", get(share_get_key));
+    }
+    let app = app.with_state(Arc::new(state));
 
     let listener = tokio::net::TcpListener::bind(cfg.listen)
         .await
         .with_context(|| format!("bind {}", cfg.listen))?;
     info!(addr = %cfg.listen, "bibliotheca-http listening");
-    axum::serve(listener, app).await?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -176,6 +193,94 @@ async fn delete_object(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(CoreError::NotFound(_)) => StatusCode::NOT_FOUND.into_response(),
         Err(CoreError::PermissionDenied) => deny(user.is_none()),
+        Err(e) => server_error(e),
+    }
+}
+
+async fn share_get_root(
+    State(state): State<Arc<AppState>>,
+    Path(token): Path<String>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    serve_share(&state, &token, "", addr, &headers)
+}
+
+async fn share_get_key(
+    State(state): State<Arc<AppState>>,
+    Path((token, key)): Path<(String, String)>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    serve_share(&state, &token, &key, addr, &headers)
+}
+
+fn serve_share(
+    state: &AppState,
+    token: &str,
+    key: &str,
+    remote: SocketAddr,
+    headers: &HeaderMap,
+) -> Response {
+    if !state.share_enabled {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let user_agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let remote_str = remote.ip().to_string();
+
+    // Look up the grant first so we can reject obviously-wrong
+    // requests (e.g. a pinned-key mismatch) without charging a
+    // use. `consume_share` is the atomic "decrement a counter"
+    // step; it should only fire on a request that would actually
+    // be served.
+    let preview = match state.svc.get_share_by_token(token) {
+        Ok(g) => g,
+        Err(CoreError::NotFound(_)) => return StatusCode::NOT_FOUND.into_response(),
+        Err(e) => return server_error(e),
+    };
+    if let Some(pinned) = &preview.key {
+        if !key.is_empty() && key != pinned {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+    } else if key.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "share covers whole subvolume, key required in URL",
+        )
+            .into_response();
+    }
+
+    let grant = match state.svc.consume_share(token, key, &remote_str, user_agent) {
+        Ok(g) => g,
+        Err(CoreError::NotFound(_)) => return StatusCode::NOT_FOUND.into_response(),
+        Err(CoreError::PermissionDenied) => return StatusCode::GONE.into_response(),
+        Err(CoreError::InvalidArgument(msg)) => {
+            return if msg.contains("expired") {
+                StatusCode::GONE.into_response()
+            } else if msg.contains("exhausted") {
+                StatusCode::TOO_MANY_REQUESTS.into_response()
+            } else {
+                (StatusCode::BAD_REQUEST, msg).into_response()
+            };
+        }
+        Err(e) => return server_error(e),
+    };
+    match state.svc.read_shared_object(&grant, key) {
+        Ok((_, bytes)) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+                (header::CONTENT_LENGTH, bytes.len().to_string()),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(CoreError::NotFound(_)) => StatusCode::NOT_FOUND.into_response(),
+        Err(CoreError::PermissionDenied) => StatusCode::FORBIDDEN.into_response(),
+        Err(CoreError::InvalidArgument(msg)) => (StatusCode::BAD_REQUEST, msg).into_response(),
         Err(e) => server_error(e),
     }
 }

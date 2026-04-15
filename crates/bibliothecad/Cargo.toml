@@ -52,6 +52,8 @@ time.workspace = true
 futures.workspace = true
 async-stream.workspace = true
 url.workspace = true
+rand.workspace = true
+base64.workspace = true
 mdns-sd = { workspace = true, optional = true }
 
 [features]

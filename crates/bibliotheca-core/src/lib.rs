@@ -14,6 +14,7 @@ pub mod error;
 pub mod identity;
 pub mod password;
 pub mod service;
+pub mod share;
 pub mod store;
 pub mod subvolume;
 

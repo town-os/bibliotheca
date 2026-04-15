@@ -7,6 +7,7 @@ use bibliotheca_config::BibliothecaConfig;
 use bibliotheca_oauth::{run_flow, BrokerParams};
 use bibliotheca_proto::v1::anisette_admin_client::AnisetteAdminClient;
 use bibliotheca_proto::v1::identity_client::IdentityClient;
+use bibliotheca_proto::v1::sharing_client::SharingClient;
 use bibliotheca_proto::v1::storage_client::StorageClient;
 use bibliotheca_proto::v1::sync_admin_client::SyncAdminClient;
 use bibliotheca_proto::v1::{
@@ -62,10 +63,58 @@ enum Cmd {
         #[command(subcommand)]
         cmd: SyncCmd,
     },
+    /// Share-link (unguessable URL) management.
+    Share {
+        #[command(subcommand)]
+        cmd: ShareCmd,
+    },
     /// Embedded anisette proxy.
     Anisette {
         #[command(subcommand)]
         cmd: AnisetteCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ShareCmd {
+    /// Mint a new share token for a subvolume (and optionally a
+    /// single key inside it).
+    Create {
+        #[arg(long)]
+        subvolume: String,
+        #[arg(long)]
+        owner: String,
+        /// Optional pinned key. Omit for a whole-subvolume share.
+        #[arg(long)]
+        key: Option<String>,
+        /// Seconds the share should live. 0 = use daemon default.
+        #[arg(long, default_value_t = 0)]
+        ttl_secs: u64,
+        /// Maximum number of successful uses. 0 = use daemon default
+        /// (which in turn defaults to unlimited).
+        #[arg(long, default_value_t = 0)]
+        use_limit: u64,
+        #[arg(long, default_value = "")]
+        note: String,
+    },
+    List {
+        /// Restrict listing to one subvolume (id or name).
+        #[arg(long)]
+        subvolume: Option<String>,
+    },
+    Get {
+        id_or_token: String,
+    },
+    Revoke {
+        id: String,
+    },
+    Delete {
+        id: String,
+    },
+    Events {
+        id: String,
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
     },
 }
 
@@ -498,6 +547,10 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Cmd::Share { cmd } => {
+            let mut client = SharingClient::new(channel);
+            run_share_cmd(&mut client, cmd).await?;
+        }
     }
 
     Ok(())
@@ -657,6 +710,107 @@ async fn run_sync_oauth_cmd(
             let id = resp.into_inner().credentials_id;
             println!("credentials id:\t{id}");
             println!("pass `--existing-credentials-id {id}` to `sync mount create` to bind it.");
+        }
+    }
+    Ok(())
+}
+
+fn print_share_grant(g: &pb::ShareGrant) {
+    let exp = if g.expires_at == 0 {
+        "never".to_string()
+    } else {
+        g.expires_at.to_string()
+    };
+    let uses = if g.use_limit == 0 {
+        format!("{}/∞", g.uses)
+    } else {
+        format!("{}/{}", g.uses, g.use_limit)
+    };
+    let state = if g.revoked { "revoked" } else { "active" };
+    let key = if g.key.is_empty() {
+        "<subvolume>".to_string()
+    } else {
+        g.key.clone()
+    };
+    println!(
+        "{id}\t{key}\t{state}\t{uses}\t{exp}\t{token}",
+        id = g.id,
+        key = key,
+        state = state,
+        uses = uses,
+        exp = exp,
+        token = g.token,
+    );
+}
+
+async fn run_share_cmd(
+    client: &mut SharingClient<tonic::transport::Channel>,
+    cmd: ShareCmd,
+) -> anyhow::Result<()> {
+    match cmd {
+        ShareCmd::Create {
+            subvolume,
+            owner,
+            key,
+            ttl_secs,
+            use_limit,
+            note,
+        } => {
+            let resp = client
+                .create(pb::CreateShareRequest {
+                    subvolume_id: subvolume,
+                    created_by: owner,
+                    key: key.unwrap_or_default(),
+                    ttl_secs,
+                    use_limit,
+                    note,
+                })
+                .await?;
+            let inner = resp.into_inner();
+            if let Some(g) = &inner.grant {
+                print_share_grant(g);
+            }
+            if !inner.url.is_empty() {
+                println!("url:\t{}", inner.url);
+            }
+        }
+        ShareCmd::List { subvolume } => {
+            let resp = client
+                .list(pb::ListSharesRequest {
+                    subvolume_id: subvolume.unwrap_or_default(),
+                })
+                .await?;
+            for g in resp.into_inner().grants {
+                print_share_grant(&g);
+            }
+        }
+        ShareCmd::Get { id_or_token } => {
+            let g = client
+                .get(pb::GetShareRequest { id_or_token })
+                .await?
+                .into_inner();
+            print_share_grant(&g);
+        }
+        ShareCmd::Revoke { id } => {
+            client.revoke(pb::RevokeShareRequest { id }).await?;
+        }
+        ShareCmd::Delete { id } => {
+            client.delete(pb::DeleteShareRequest { id }).await?;
+        }
+        ShareCmd::Events { id, limit } => {
+            let resp = client
+                .list_events(pb::ListShareEventsRequest { id, limit })
+                .await?;
+            for ev in resp.into_inner().events {
+                let ts = ev.ts.map(|t| t.seconds).unwrap_or(0);
+                println!(
+                    "{ts}\t{action}\t{status}\t{ip}\t{key}",
+                    action = ev.action,
+                    status = ev.status,
+                    ip = ev.remote_ip,
+                    key = ev.key,
+                );
+            }
         }
     }
     Ok(())

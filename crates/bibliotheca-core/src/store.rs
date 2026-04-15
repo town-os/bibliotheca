@@ -131,6 +131,43 @@ CREATE TABLE IF NOT EXISTS sync_events (
 
 CREATE INDEX IF NOT EXISTS sync_events_mount_ts_idx
     ON sync_events(mount_id, ts DESC);
+
+CREATE TABLE IF NOT EXISTS share_grants (
+    id              TEXT PRIMARY KEY,
+    token           TEXT NOT NULL UNIQUE,
+    subvolume_id    TEXT NOT NULL REFERENCES subvolumes(id) ON DELETE CASCADE,
+    -- Empty string means "whole subvolume, key comes from the URL path".
+    -- A non-empty value pins the share to exactly one key.
+    key             TEXT NOT NULL DEFAULT '',
+    created_by      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at      INTEGER NOT NULL,
+    -- Nullable: null means no expiry.
+    expires_at      INTEGER,
+    -- Nullable: null means unlimited uses.
+    use_limit       INTEGER,
+    uses            INTEGER NOT NULL DEFAULT 0,
+    revoked         INTEGER NOT NULL DEFAULT 0,
+    note            TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS share_grants_token_idx
+    ON share_grants(token);
+CREATE INDEX IF NOT EXISTS share_grants_sv_idx
+    ON share_grants(subvolume_id);
+
+CREATE TABLE IF NOT EXISTS share_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    share_id    TEXT NOT NULL REFERENCES share_grants(id) ON DELETE CASCADE,
+    ts          INTEGER NOT NULL,
+    action      TEXT NOT NULL,              -- create|use|revoke|expire|deny
+    remote_ip   TEXT NOT NULL DEFAULT '',
+    user_agent  TEXT NOT NULL DEFAULT '',
+    key         TEXT NOT NULL DEFAULT '',
+    status      INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS share_events_share_ts_idx
+    ON share_events(share_id, ts DESC);
 "#;
 
 #[derive(Clone)]
@@ -961,6 +998,200 @@ impl Store {
         Ok(rows)
     }
 
+    // ------- share grants -------
+
+    pub fn insert_share_grant(&self, row: &ShareGrantRow) -> Result<()> {
+        let conn = self.inner.lock();
+        conn.execute(
+            "INSERT INTO share_grants
+                (id, token, subvolume_id, key, created_by, created_at,
+                 expires_at, use_limit, uses, revoked, note)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                row.id,
+                row.token,
+                row.subvolume_id,
+                row.key,
+                row.created_by,
+                row.created_at,
+                row.expires_at,
+                row.use_limit,
+                row.uses,
+                row.revoked as i64,
+                row.note,
+            ],
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::SqliteFailure(ref f, _)
+                if f.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                Error::AlreadyExists(format!("share {}", row.id))
+            }
+            other => other.into(),
+        })?;
+        Ok(())
+    }
+
+    pub fn get_share_grant_by_id(&self, id: &str) -> Result<ShareGrantRow> {
+        let conn = self.inner.lock();
+        conn.query_row(
+            "SELECT id, token, subvolume_id, key, created_by, created_at,
+                    expires_at, use_limit, uses, revoked, note
+             FROM share_grants WHERE id = ?1",
+            params![id],
+            row_to_share_grant,
+        )
+        .optional()?
+        .ok_or_else(|| Error::NotFound(format!("share {id}")))
+    }
+
+    pub fn get_share_grant_by_token(&self, token: &str) -> Result<ShareGrantRow> {
+        let conn = self.inner.lock();
+        conn.query_row(
+            "SELECT id, token, subvolume_id, key, created_by, created_at,
+                    expires_at, use_limit, uses, revoked, note
+             FROM share_grants WHERE token = ?1",
+            params![token],
+            row_to_share_grant,
+        )
+        .optional()?
+        .ok_or_else(|| Error::NotFound("share token".into()))
+    }
+
+    pub fn list_share_grants(
+        &self,
+        subvolume_id: Option<SubvolumeId>,
+    ) -> Result<Vec<ShareGrantRow>> {
+        let conn = self.inner.lock();
+        if let Some(sv) = subvolume_id {
+            let mut stmt = conn.prepare(
+                "SELECT id, token, subvolume_id, key, created_by, created_at,
+                        expires_at, use_limit, uses, revoked, note
+                 FROM share_grants WHERE subvolume_id = ?1
+                 ORDER BY created_at DESC",
+            )?;
+            let rows = stmt
+                .query_map(params![sv.to_string()], row_to_share_grant)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        } else {
+            let mut stmt = conn.prepare(
+                "SELECT id, token, subvolume_id, key, created_by, created_at,
+                        expires_at, use_limit, uses, revoked, note
+                 FROM share_grants ORDER BY created_at DESC",
+            )?;
+            let rows = stmt
+                .query_map([], row_to_share_grant)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        }
+    }
+
+    pub fn revoke_share_grant(&self, id: &str) -> Result<()> {
+        let conn = self.inner.lock();
+        let n = conn.execute(
+            "UPDATE share_grants SET revoked = 1 WHERE id = ?1",
+            params![id],
+        )?;
+        if n == 0 {
+            return Err(Error::NotFound(format!("share {id}")));
+        }
+        Ok(())
+    }
+
+    pub fn delete_share_grant(&self, id: &str) -> Result<()> {
+        let conn = self.inner.lock();
+        let n = conn.execute("DELETE FROM share_grants WHERE id = ?1", params![id])?;
+        if n == 0 {
+            return Err(Error::NotFound(format!("share {id}")));
+        }
+        Ok(())
+    }
+
+    /// Atomically increment `uses` iff the grant is still usable.
+    /// Returns the updated row on success, or an error describing
+    /// why the token is no longer valid (revoked, expired, exhausted).
+    pub fn consume_share_use(&self, token: &str, now: i64) -> Result<ShareGrantRow> {
+        let conn = self.inner.lock();
+        let row: ShareGrantRow = conn
+            .query_row(
+                "SELECT id, token, subvolume_id, key, created_by, created_at,
+                        expires_at, use_limit, uses, revoked, note
+                 FROM share_grants WHERE token = ?1",
+                params![token],
+                row_to_share_grant,
+            )
+            .optional()?
+            .ok_or_else(|| Error::NotFound("share token".into()))?;
+        if row.revoked {
+            return Err(Error::PermissionDenied);
+        }
+        if let Some(exp) = row.expires_at {
+            if now >= exp {
+                return Err(Error::InvalidArgument("share expired".into()));
+            }
+        }
+        if let Some(cap) = row.use_limit {
+            if row.uses >= cap {
+                return Err(Error::InvalidArgument("share exhausted".into()));
+            }
+        }
+        conn.execute(
+            "UPDATE share_grants SET uses = uses + 1 WHERE id = ?1",
+            params![row.id],
+        )?;
+        let updated = ShareGrantRow {
+            uses: row.uses + 1,
+            ..row
+        };
+        Ok(updated)
+    }
+
+    pub fn insert_share_event(&self, ev: &ShareEventRow) -> Result<i64> {
+        let conn = self.inner.lock();
+        conn.execute(
+            "INSERT INTO share_events (share_id, ts, action, remote_ip, user_agent, key, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                ev.share_id,
+                ev.ts,
+                ev.action,
+                ev.remote_ip,
+                ev.user_agent,
+                ev.key,
+                ev.status as i64,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn recent_share_events(&self, share_id: &str, limit: u32) -> Result<Vec<ShareEventRow>> {
+        let conn = self.inner.lock();
+        let limit = if limit == 0 { 500 } else { limit };
+        let mut stmt = conn.prepare(
+            "SELECT id, share_id, ts, action, remote_ip, user_agent, key, status
+               FROM share_events
+              WHERE share_id = ?1
+              ORDER BY ts DESC, id DESC
+              LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![share_id, limit as i64], |r| {
+                Ok(ShareEventRow {
+                    id: r.get::<_, i64>(0)?,
+                    share_id: r.get::<_, String>(1)?,
+                    ts: r.get::<_, i64>(2)?,
+                    action: r.get::<_, String>(3)?,
+                    remote_ip: r.get::<_, String>(4)?,
+                    user_agent: r.get::<_, String>(5)?,
+                    key: r.get::<_, String>(6)?,
+                    status: r.get::<_, i64>(7)?.max(0) as u32,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     pub fn kv_get(&self, key: &str) -> Result<Option<String>> {
         let conn = self.inner.lock();
         Ok(conn
@@ -1129,6 +1360,49 @@ pub struct SyncEventRow {
     pub kind: String,
     pub message: String,
     pub details_json: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShareGrantRow {
+    pub id: String,
+    pub token: String,
+    pub subvolume_id: String,
+    pub key: String,
+    pub created_by: String,
+    pub created_at: i64,
+    pub expires_at: Option<i64>,
+    pub use_limit: Option<i64>,
+    pub uses: i64,
+    pub revoked: bool,
+    pub note: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShareEventRow {
+    pub id: i64,
+    pub share_id: String,
+    pub ts: i64,
+    pub action: String,
+    pub remote_ip: String,
+    pub user_agent: String,
+    pub key: String,
+    pub status: u32,
+}
+
+fn row_to_share_grant(r: &rusqlite::Row<'_>) -> rusqlite::Result<ShareGrantRow> {
+    Ok(ShareGrantRow {
+        id: r.get::<_, String>(0)?,
+        token: r.get::<_, String>(1)?,
+        subvolume_id: r.get::<_, String>(2)?,
+        key: r.get::<_, String>(3)?,
+        created_by: r.get::<_, String>(4)?,
+        created_at: r.get::<_, i64>(5)?,
+        expires_at: r.get::<_, Option<i64>>(6)?,
+        use_limit: r.get::<_, Option<i64>>(7)?,
+        uses: r.get::<_, i64>(8)?,
+        revoked: r.get::<_, i64>(9)? != 0,
+        note: r.get::<_, String>(10)?,
+    })
 }
 
 const SYNC_MOUNT_COLS: &str = "id, name, kind, subvolume_id, townos_name, direction,

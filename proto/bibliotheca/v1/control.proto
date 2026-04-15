@@ -413,3 +413,85 @@ service SyncAdmin {
   rpc RotateSecretKey(RotateSecretKeyRequest) returns (google.protobuf.Empty);
   rpc StoreOAuthCredentials(StoreOAuthCredentialsRequest) returns (StoreOAuthCredentialsResponse);
 }
+
+// =====================================================================
+// Sharing — unguessable HTTP URLs that serve a single key (or a whole
+// subvolume) without bibliotheca auth. Served anonymously by the
+// `bibliotheca-http` interface on `/s/:token/*key`. Admins mint
+// them, revoke them, and list/inspect them over this control-plane
+// service. See crates/bibliotheca-core/src/share.rs for the data
+// model.
+// =====================================================================
+
+message ShareGrant {
+  string id = 1;
+  string token = 2;
+  string subvolume_id = 3;
+  // Empty string means "whole subvolume, the key comes in at request
+  // time via the URL path". A non-empty value pins the share to
+  // exactly one key.
+  string key = 4;
+  string created_by = 5;
+  google.protobuf.Timestamp created_at = 6;
+  // Zero = no expiry.
+  int64 expires_at = 7;
+  // Zero = unlimited.
+  uint64 use_limit = 8;
+  uint64 uses = 9;
+  bool revoked = 10;
+  string note = 11;
+}
+
+message CreateShareRequest {
+  string subvolume_id = 1;
+  string created_by = 2;
+  // Empty = whole-subvolume share.
+  string key = 3;
+  // 0 = use the daemon default (`share.default_ttl_secs`).
+  uint64 ttl_secs = 4;
+  // 0 = unlimited / use daemon default.
+  uint64 use_limit = 5;
+  string note = 6;
+}
+
+message CreateShareResponse {
+  ShareGrant grant = 1;
+  // Convenience: fully-assembled public URL if the daemon has a
+  // `share.base_url` configured. Otherwise empty.
+  string url = 2;
+}
+
+message ListSharesRequest {
+  // Empty = all subvolumes.
+  string subvolume_id = 1;
+}
+message ListSharesResponse { repeated ShareGrant grants = 1; }
+message GetShareRequest { string id_or_token = 1; }
+message RevokeShareRequest { string id = 1; }
+message DeleteShareRequest { string id = 1; }
+
+message ShareEvent {
+  int64 id = 1;
+  string share_id = 2;
+  google.protobuf.Timestamp ts = 3;
+  string action = 4;        // create|use|revoke|expire|deny
+  string remote_ip = 5;
+  string user_agent = 6;
+  string key = 7;
+  uint32 status = 8;
+}
+
+message ListShareEventsRequest {
+  string id = 1;
+  uint32 limit = 2;
+}
+message ListShareEventsResponse { repeated ShareEvent events = 1; }
+
+service Sharing {
+  rpc Create(CreateShareRequest) returns (CreateShareResponse);
+  rpc List(ListSharesRequest) returns (ListSharesResponse);
+  rpc Get(GetShareRequest) returns (ShareGrant);
+  rpc Revoke(RevokeShareRequest) returns (google.protobuf.Empty);
+  rpc Delete(DeleteShareRequest) returns (google.protobuf.Empty);
+  rpc ListEvents(ListShareEventsRequest) returns (ListShareEventsResponse);
+}

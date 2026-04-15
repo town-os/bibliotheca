@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use bibliotheca_config::ShareConfig;
 use bibliotheca_core::backend::SubvolumeBackend;
 use bibliotheca_core::service::BibliothecaService;
 use bibliotheca_core::store::Store;
@@ -41,7 +42,8 @@ async fn spawn_daemon() -> Daemon {
 
     let socket_for_server = socket.clone();
     let handle = tokio::spawn(async move {
-        bibliothecad::control::serve(svc, None, None, socket_for_server).await
+        bibliothecad::control::serve(svc, None, None, ShareConfig::default(), socket_for_server)
+            .await
     });
 
     for _ in 0..100 {
