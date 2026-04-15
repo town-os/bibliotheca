@@ -1,0 +1,93 @@
+# Example bibliotheca.yml. Copy to /etc/bibliotheca/bibliotheca.yml
+# and edit. Every field below is optional; omitting a section
+# (or a field within a section) restores the built-in default
+# baked into `bibliotheca-config`.
+
+daemon:
+  socket: /run/bibliotheca/control.sock
+  db:     /var/lib/bibliotheca/bibliotheca.db
+  root:   /var/lib/bibliotheca/subvolumes
+  btrfs_bin: btrfs
+  # Optional JSON file for the data-plane interface config.
+  # See `crates/bibliothecad/src/interfaces.rs` for the shape.
+  # interfaces_file: /etc/bibliotheca/interfaces.json
+
+sync:
+  # town-os systemcontroller used to procure backing
+  # subvolumes for sync mounts.
+  # townos_url: https://townos.internal/
+  # townos_username: bibliotheca
+  # townos_password_file: /etc/bibliotheca/townos.pw
+  townos_storage_root: /var/lib/townos/storage
+  # File holding a 64-char hex master key used to encrypt
+  # credentials at rest. Either this OR the env var
+  # `BIBLIOTHECA_SECRET_KEY` must be present for sync to start.
+  # secret_key_file: /etc/bibliotheca/sync.key
+  secret_key_env: BIBLIOTHECA_SECRET_KEY
+  default_quota_bytes: 10737418240  # 10 GiB
+  default_interval_secs: 300
+
+anisette:
+  # Off by default; sync-icloud mounts fail loudly until you
+  # either set `enabled: true` here or pass `--anisette-*` on
+  # the daemon command line.
+  enabled: false
+  listen: 127.0.0.1:6969
+  upstreams: []
+  # Example:
+  # upstreams:
+  #   - https://anisette.iphone.tailnet.ts.net/
+  #   - https://anisette.mac.tailnet.ts.net/
+  cache_ttl_secs: 20
+  request_timeout_secs: 10
+  backoff_secs: 60
+  # Requires the `mdns` cargo feature on bibliothecad.
+  mdns_enabled: false
+
+oauth:
+  # Loopback settings for the bibliothecactl broker that runs the
+  # authorization-code dance locally and returns refresh tokens to
+  # the daemon.
+  callback_host: 127.0.0.1
+  callback_port_min: 0          # 0 means "any free port"
+  callback_port_max: 0
+  callback_timeout_secs: 600
+  providers:
+    dropbox:
+      authorize_url: https://www.dropbox.com/oauth2/authorize
+      token_url:     https://api.dropboxapi.com/oauth2/token
+      scopes:
+        - files.content.read
+        - files.content.write
+        - files.metadata.read
+      client_id: ""             # fill in from the provider dev console
+      # client_secret_file: /etc/bibliotheca/dropbox.secret
+      pkce: true
+      extra_authorize_params: {}
+    gphotos:
+      authorize_url: https://accounts.google.com/o/oauth2/v2/auth
+      token_url:     https://oauth2.googleapis.com/token
+      scopes:
+        - https://www.googleapis.com/auth/photoslibrary
+      client_id: ""
+      # client_secret_file: /etc/bibliotheca/gphotos.secret
+      pkce: true
+      extra_authorize_params:
+        access_type: offline
+        prompt: consent
+
+share:
+  # Public base URL prepended to new share URLs when
+  # pretty-printing. Token lookup + validity are unaffected.
+  # base_url: https://share.example.org/
+  default_ttl_secs: 604800      # 7 days
+  # max_ttl_secs: 2592000       # 30 days (cap)
+  # default_use_limit: 100
+  token_bytes: 32
+
+archive:
+  root: /var/lib/bibliotheca/archives
+  default_kind: snapshot        # 'snapshot' | 'tarball'
+  default_retention_days: 365
+  lifecycle_interval_secs: 3600
+  min_archive_age_days: 1

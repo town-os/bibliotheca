@@ -1,15 +1,24 @@
 //! `bibliothecad` — Bibliotheca object storage daemon.
 //!
-//! Serves the gRPC control plane on a local Unix socket and orchestrates
-//! the data-plane interface crates. Configuration is intentionally
-//! command-line driven so it can be supervised by town-os's existing
-//! systemd-shaped service manager.
+//! Configuration precedence, top to bottom:
+//!
+//!   1. Command line flags (highest priority)
+//!   2. Environment variables (where supported)
+//!   3. YAML config file (`--config /path.yml` or
+//!      `/etc/bibliotheca/bibliotheca.yml`)
+//!   4. Built-in defaults in `bibliotheca-config`
+//!
+//! Every flag below is `Option<T>` so the resolution above can
+//! happen cleanly in `main` without "what was the CLI default"
+//! detection. Long-standing flags keep their previous names and
+//! environment-variable bindings; the file is additive.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use bibliotheca_btrfs::BtrfsBackend;
+use bibliotheca_config::BibliothecaConfig;
 use bibliotheca_core::backend::SubvolumeBackend;
 use bibliotheca_core::service::BibliothecaService;
 use bibliotheca_core::store::Store;
@@ -23,8 +32,6 @@ use bibliothecad::anisette::AnisetteBootConfig;
 use bibliothecad::sync::SyncBootConfig;
 use bibliothecad::{anisette, control, interfaces, sync};
 
-const DEFAULT_SYNC_QUOTA: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
-
 #[derive(Debug, Parser)]
 #[command(
     name = "bibliothecad",
@@ -32,91 +39,48 @@ const DEFAULT_SYNC_QUOTA: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
     about = "Bibliotheca object storage daemon"
 )]
 struct Args {
-    /// Unix socket path for the gRPC control plane.
-    #[arg(
-        long,
-        env = "BIBLIOTHECA_SOCKET",
-        default_value = "/run/bibliotheca/control.sock"
-    )]
-    socket: PathBuf,
+    /// Path to the YAML config file. Defaults to
+    /// `/etc/bibliotheca/bibliotheca.yml` when unset; if that
+    /// file does not exist, built-in defaults are used.
+    #[arg(long, env = "BIBLIOTHECA_CONFIG")]
+    config: Option<PathBuf>,
 
-    /// Sqlite metadata database path.
-    #[arg(
-        long,
-        env = "BIBLIOTHECA_DB",
-        default_value = "/var/lib/bibliotheca/bibliotheca.db"
-    )]
-    db: PathBuf,
+    #[arg(long, env = "BIBLIOTHECA_SOCKET")]
+    socket: Option<PathBuf>,
 
-    /// Filesystem root under which subvolumes are created.
-    #[arg(
-        long,
-        env = "BIBLIOTHECA_ROOT",
-        default_value = "/var/lib/bibliotheca/subvolumes"
-    )]
-    root: PathBuf,
+    #[arg(long, env = "BIBLIOTHECA_DB")]
+    db: Option<PathBuf>,
 
-    /// Path to the btrfs binary.
-    #[arg(long, env = "BIBLIOTHECA_BTRFS_BIN", default_value = "btrfs")]
-    btrfs_bin: PathBuf,
+    #[arg(long, env = "BIBLIOTHECA_ROOT")]
+    root: Option<PathBuf>,
 
-    /// Path to a JSON file with interface configuration. Optional —
-    /// without it, all data-plane interfaces stay disabled (the safe
-    /// default that the spec requires for HTTP).
+    #[arg(long, env = "BIBLIOTHECA_BTRFS_BIN")]
+    btrfs_bin: Option<PathBuf>,
+
     #[arg(long, env = "BIBLIOTHECA_INTERFACES")]
     interfaces: Option<PathBuf>,
 
-    /// town-os systemcontroller base URL, used by the sync subsystem
-    /// to procure subvolumes for mounts.
     #[arg(long, env = "BIBLIOTHECA_TOWNOS_URL")]
     townos_url: Option<Url>,
 
-    /// town-os username to authenticate as when provisioning storage.
     #[arg(long, env = "BIBLIOTHECA_TOWNOS_USERNAME")]
     townos_username: Option<String>,
 
-    /// File containing the town-os password. Stored out-of-band so it
-    /// never appears on the command line or in process listings.
     #[arg(long, env = "BIBLIOTHECA_TOWNOS_PASSWORD_FILE")]
     townos_password_file: Option<PathBuf>,
 
-    /// Absolute filesystem path under which town-os mounts the
-    /// subvolumes it creates. A procured volume named
-    /// `user/sync-alice-icloud` is accessed at
-    /// `{storage_root}/user/sync-alice-icloud`.
-    #[arg(
-        long,
-        env = "BIBLIOTHECA_TOWNOS_STORAGE_ROOT",
-        default_value = "/var/lib/townos/storage"
-    )]
-    townos_storage_root: PathBuf,
+    #[arg(long, env = "BIBLIOTHECA_TOWNOS_STORAGE_ROOT")]
+    townos_storage_root: Option<PathBuf>,
 
-    /// File containing the 32-byte (hex-encoded) master key used to
-    /// encrypt sync connector credentials at rest. Without it, the
-    /// sync subsystem refuses to start.
     #[arg(long, env = "BIBLIOTHECA_SYNC_SECRET_KEY_FILE")]
     sync_secret_key_file: Option<PathBuf>,
 
-    /// Default quota (in bytes) applied to a new sync mount if the
-    /// create request does not specify one.
-    #[arg(long, default_value_t = DEFAULT_SYNC_QUOTA)]
-    sync_default_quota_bytes: u64,
+    #[arg(long)]
+    sync_default_quota_bytes: Option<u64>,
 
-    /// TCP address to bind the embedded anisette proxy on. Only
-    /// spawned if at least one `--anisette-upstream` is supplied.
-    #[arg(
-        long,
-        env = "BIBLIOTHECA_ANISETTE_LISTEN",
-        default_value = "127.0.0.1:6969"
-    )]
-    anisette_listen: SocketAddr,
+    #[arg(long, env = "BIBLIOTHECA_ANISETTE_LISTEN")]
+    anisette_listen: Option<SocketAddr>,
 
-    /// Upstream anisette URL. Repeatable. All upstreams must be
-    /// operator-controlled endpoints — typically peer bibliotheca
-    /// instances reachable over a VPN and resolved via private
-    /// DNS. Without any upstreams, the proxy stays disabled and
-    /// `sync-icloud` mounts must point at an `anisette_url`
-    /// themselves.
     #[arg(
         long = "anisette-upstream",
         env = "BIBLIOTHECA_ANISETTE_UPSTREAMS",
@@ -124,23 +88,17 @@ struct Args {
     )]
     anisette_upstreams: Vec<Url>,
 
-    /// TTL (seconds) for cached anisette responses.
-    #[arg(long, default_value_t = 20)]
-    anisette_cache_ttl_secs: u64,
+    #[arg(long)]
+    anisette_cache_ttl_secs: Option<u64>,
 
-    /// Per-request timeout (seconds) for the anisette upstreams.
-    #[arg(long, default_value_t = 10)]
-    anisette_request_timeout_secs: u64,
+    #[arg(long)]
+    anisette_request_timeout_secs: Option<u64>,
 
-    /// Backoff (seconds) for a failed anisette upstream.
-    #[arg(long, default_value_t = 60)]
-    anisette_backoff_secs: u64,
+    #[arg(long)]
+    anisette_backoff_secs: Option<u64>,
 
-    /// Enable mDNS/Bonjour discovery of peer anisette servers on
-    /// the local network. Requires the daemon to be built with
-    /// the `mdns` feature; without it, the flag is a no-op.
-    #[arg(long, default_value_t = false)]
-    anisette_mdns: bool,
+    #[arg(long)]
+    anisette_mdns: Option<bool>,
 }
 
 #[tokio::main]
@@ -151,21 +109,34 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+    let cfg = BibliothecaConfig::load_or_default(args.config.as_deref())?;
 
-    if let Some(parent) = args.db.parent() {
+    let socket = args.socket.clone().unwrap_or(cfg.daemon.socket.clone());
+    let db = args.db.clone().unwrap_or(cfg.daemon.db.clone());
+    let root = args.root.clone().unwrap_or(cfg.daemon.root.clone());
+    let btrfs_bin = args
+        .btrfs_bin
+        .clone()
+        .unwrap_or(cfg.daemon.btrfs_bin.clone());
+    let interfaces_path = args
+        .interfaces
+        .clone()
+        .or_else(|| cfg.daemon.interfaces_file.clone());
+
+    if let Some(parent) = db.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::create_dir_all(&args.root)?;
-    if let Some(parent) = args.socket.parent() {
+    std::fs::create_dir_all(&root)?;
+    if let Some(parent) = socket.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    let store = Store::open(&args.db)?;
+    let store = Store::open(&db)?;
     let backend: Arc<dyn SubvolumeBackend> =
-        Arc::new(BtrfsBackend::new(args.root.clone()).with_bin(args.btrfs_bin.clone()));
+        Arc::new(BtrfsBackend::new(root.clone()).with_bin(btrfs_bin.clone()));
     let svc = BibliothecaService::new(store.clone(), backend);
 
-    let ifaces = interfaces::load(args.interfaces.as_deref())?;
+    let ifaces = interfaces::load(interfaces_path.as_deref())?;
     interfaces::spawn_enabled(svc.clone(), &ifaces);
 
     let shutdown = CancellationToken::new();
@@ -173,36 +144,60 @@ async fn main() -> anyhow::Result<()> {
         svc.clone(),
         store,
         SyncBootConfig {
-            townos_url: args.townos_url,
-            townos_username: args.townos_username,
-            townos_password_file: args.townos_password_file,
-            townos_storage_root: args.townos_storage_root,
-            secret_key_file: args.sync_secret_key_file,
-            secret_key_env: Some("BIBLIOTHECA_SECRET_KEY".to_string()),
-            default_quota_bytes: args.sync_default_quota_bytes,
+            townos_url: args.townos_url.or(cfg.sync.townos_url.clone()),
+            townos_username: args.townos_username.or(cfg.sync.townos_username.clone()),
+            townos_password_file: args
+                .townos_password_file
+                .or(cfg.sync.townos_password_file.clone()),
+            townos_storage_root: args
+                .townos_storage_root
+                .clone()
+                .unwrap_or(cfg.sync.townos_storage_root.clone()),
+            secret_key_file: args
+                .sync_secret_key_file
+                .or(cfg.sync.secret_key_file.clone()),
+            secret_key_env: Some(cfg.sync.secret_key_env.clone()),
+            default_quota_bytes: args
+                .sync_default_quota_bytes
+                .unwrap_or(cfg.sync.default_quota_bytes),
         },
         shutdown.clone(),
     )
     .await?;
 
-    let anisette_cfg = if args.anisette_upstreams.is_empty() && !args.anisette_mdns {
-        None
+    let anisette_listen = args.anisette_listen.unwrap_or(cfg.anisette.listen);
+    let anisette_upstreams = if args.anisette_upstreams.is_empty() {
+        cfg.anisette.upstreams.clone()
     } else {
+        args.anisette_upstreams.clone()
+    };
+    let anisette_mdns = args.anisette_mdns.unwrap_or(cfg.anisette.mdns_enabled);
+    let anisette_enabled = cfg.anisette.enabled || !anisette_upstreams.is_empty() || anisette_mdns;
+
+    let anisette_cfg = if anisette_enabled {
         Some(AnisetteBootConfig {
-            listen: args.anisette_listen,
-            upstreams: args.anisette_upstreams.clone(),
-            cache_ttl_secs: args.anisette_cache_ttl_secs,
-            request_timeout_secs: args.anisette_request_timeout_secs,
-            backoff_secs: args.anisette_backoff_secs,
-            mdns_enabled: args.anisette_mdns,
+            listen: anisette_listen,
+            upstreams: anisette_upstreams,
+            cache_ttl_secs: args
+                .anisette_cache_ttl_secs
+                .unwrap_or(cfg.anisette.cache_ttl_secs),
+            request_timeout_secs: args
+                .anisette_request_timeout_secs
+                .unwrap_or(cfg.anisette.request_timeout_secs),
+            backoff_secs: args
+                .anisette_backoff_secs
+                .unwrap_or(cfg.anisette.backoff_secs),
+            mdns_enabled: anisette_mdns,
         })
+    } else {
+        None
     };
     let anisette_provider = anisette::boot(anisette_cfg, shutdown.clone());
     let anisette_for_ctl = anisette_provider
         .clone()
-        .map(|p| (p, args.anisette_listen.to_string()));
+        .map(|p| (p, anisette_listen.to_string()));
 
-    control::serve(svc, supervisor, anisette_for_ctl, args.socket.clone()).await?;
+    control::serve(svc, supervisor, anisette_for_ctl, socket.clone()).await?;
     shutdown.cancel();
     info!("bibliothecad shutting down");
     Ok(())

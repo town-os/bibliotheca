@@ -22,6 +22,7 @@ members = [
     "crates/bibliotheca-sync-gphotos",
     "crates/bibliotheca-sync-icloud",
     "crates/bibliotheca-anisette",
+    "crates/bibliotheca-config",
     "crates/bibliothecad",
     "crates/bibliothecactl",
 ]
@@ -55,6 +56,7 @@ bibliotheca-sync-solid = { path = "crates/bibliotheca-sync-solid" }
 bibliotheca-sync-gphotos = { path = "crates/bibliotheca-sync-gphotos" }
 bibliotheca-sync-icloud = { path = "crates/bibliotheca-sync-icloud" }
 bibliotheca-anisette = { path = "crates/bibliotheca-anisette" }
+bibliotheca-config = { path = "crates/bibliotheca-config" }
 
 anyhow = "1"
 thiserror = "1"
@@ -95,10 +97,12 @@ num-bigint = "0.4"
 pbkdf2 = "0.12"
 rusqlite = { version = "0.32", features = ["bundled"] }
 parking_lot = "0.12"
-url = "2"
+url = { version = "2", features = ["serde"] }
 tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 mdns-sd = "0.13"
+serde_yaml_ng = "0.10"
+tar = "0.4"
 
 [profile.release]
 lto = "thin"
