@@ -776,7 +776,6 @@ impl SyncAdmin for SyncAdminSvc {
         let kind = connector_kind_from_pb(r.kind)?;
         let direction = direction_from_pb(r.direction)?;
         let owner = parse_user_id(&r.owner_user_id)?;
-        let blob = credentials_from_pb(r.credentials)?;
         let config_json = serde_json::to_string(&r.config)
             .map_err(|e| Status::invalid_argument(format!("config: {e}")))?;
         let spec = MountSpec {
@@ -793,8 +792,48 @@ impl SyncAdmin for SyncAdminSvc {
             config_json,
             credentials_id: None,
         };
-        let mount = sup.create_mount(spec, blob).await.map_err(sync_err)?;
+        let mount = match (r.credentials, r.existing_credentials_id.as_str()) {
+            (Some(_), id) if !id.is_empty() => {
+                return Err(Status::invalid_argument(
+                    "credentials and existing_credentials_id are mutually exclusive",
+                ));
+            }
+            (Some(creds), _) => {
+                let blob = credentials_from_pb(Some(creds))?;
+                sup.create_mount(spec, blob).await.map_err(sync_err)?
+            }
+            (None, id) if !id.is_empty() => sup
+                .create_mount_with_existing_credentials(spec, id.to_string())
+                .await
+                .map_err(sync_err)?,
+            (None, _) => {
+                return Err(Status::invalid_argument("missing credentials"));
+            }
+        };
         Ok(Response::new(mount_to_pb(&mount)))
+    }
+
+    async fn store_o_auth_credentials(
+        &self,
+        req: Request<pb::StoreOAuthCredentialsRequest>,
+    ) -> Result<Response<pb::StoreOAuthCredentialsResponse>, Status> {
+        let sup = self.require()?;
+        let r = req.into_inner();
+        let creds = r
+            .credentials
+            .ok_or_else(|| Status::invalid_argument("missing credentials"))?;
+        let blob = CredentialBlob::OAuth2 {
+            access_token: creds.access_token,
+            refresh_token: creds.refresh_token,
+            expires_at: creds.expires_at,
+            client_id: creds.client_id,
+            client_secret: creds.client_secret,
+            token_url: creds.token_url,
+        };
+        let id = sup.store_credentials(&blob).map_err(sync_err)?;
+        Ok(Response::new(pb::StoreOAuthCredentialsResponse {
+            credentials_id: id,
+        }))
     }
 
     async fn list_mounts(

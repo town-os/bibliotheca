@@ -52,6 +52,16 @@ use crate::trait_::{ConnectorFactory, SyncConnector};
 
 pub const EVENT_BROADCAST_CAPACITY: usize = 256;
 
+/// Where the supervisor is getting credential material from when it
+/// creates a mount. Inline blobs are encrypted + inserted fresh;
+/// existing rows (e.g. produced by `StoreOAuthCredentials`) are
+/// reused as-is and *not* rolled back on failure, since destroying a
+/// row the operator uploaded deliberately would be surprising.
+enum CredentialSource {
+    Inline(CredentialBlob),
+    Existing(String),
+}
+
 /// Factory registry: maps a `ConnectorKind` to the function that
 /// constructs the corresponding `SyncConnector` from a decrypted
 /// credential blob and a config JSON string.
@@ -210,6 +220,36 @@ impl Supervisor {
         spec: MountSpec,
         credentials: CredentialBlob,
     ) -> Result<SyncMount> {
+        self.create_mount_inner(spec, CredentialSource::Inline(credentials))
+            .await
+    }
+
+    /// Same shape as [`Self::create_mount`] but reuses an
+    /// already-encrypted credentials row. Useful when the CLI
+    /// has just run the OAuth broker flow and wants to bind the
+    /// resulting row to a new mount without re-encrypting.
+    pub async fn create_mount_with_existing_credentials(
+        &self,
+        spec: MountSpec,
+        credentials_id: String,
+    ) -> Result<SyncMount> {
+        self.create_mount_inner(spec, CredentialSource::Existing(credentials_id))
+            .await
+    }
+
+    /// Insert an encrypted credentials row without creating a
+    /// mount. Used by `SyncAdmin::StoreOAuthCredentials` to
+    /// decouple the OAuth broker flow from mount creation.
+    pub fn store_credentials(&self, blob: &CredentialBlob) -> Result<String> {
+        let (cipher, _) = self.require_enabled()?;
+        self.state.insert_credentials(cipher, blob)
+    }
+
+    async fn create_mount_inner(
+        &self,
+        spec: MountSpec,
+        credentials: CredentialSource,
+    ) -> Result<SyncMount> {
         let (cipher, townos) = self.require_enabled()?;
 
         if !self.registry.has(spec.kind) {
@@ -242,13 +282,29 @@ impl Supervisor {
             }
         };
 
-        // 3. Credentials.
-        let credentials_id = match self.state.insert_credentials(cipher, &credentials) {
-            Ok(id) => id,
-            Err(e) => {
-                let _ = self.svc.forget_subvolume(sv.id);
-                let _ = townos.remove_filesystem(&townos_name).await;
-                return Err(e);
+        // 3. Credentials. Either encrypt + insert a fresh row,
+        //    or reuse one the operator already created via
+        //    `StoreOAuthCredentials`. In the reuse case we must
+        //    not delete the row on rollback (it might back
+        //    another mount, and the operator didn't authorize
+        //    that destruction).
+        let (credentials_id, owns_credentials) = match credentials {
+            CredentialSource::Inline(blob) => match self.state.insert_credentials(cipher, &blob) {
+                Ok(id) => (id, true),
+                Err(e) => {
+                    let _ = self.svc.forget_subvolume(sv.id);
+                    let _ = townos.remove_filesystem(&townos_name).await;
+                    return Err(e);
+                }
+            },
+            CredentialSource::Existing(id) => {
+                // Sanity-check the row exists + decrypts.
+                if let Err(e) = self.state.get_credentials(cipher, &id) {
+                    let _ = self.svc.forget_subvolume(sv.id);
+                    let _ = townos.remove_filesystem(&townos_name).await;
+                    return Err(e);
+                }
+                (id, false)
             }
         };
 
@@ -261,7 +317,9 @@ impl Supervisor {
             .state
             .insert_mount(mount_id, &spec_with_creds, sv.id, &townos_name)
         {
-            let _ = self.state.delete_credentials(&credentials_id);
+            if owns_credentials {
+                let _ = self.state.delete_credentials(&credentials_id);
+            }
             let _ = self.svc.forget_subvolume(sv.id);
             let _ = townos.remove_filesystem(&townos_name).await;
             return Err(e);
@@ -272,7 +330,9 @@ impl Supervisor {
         // 5. Worker.
         if let Err(e) = self.spawn_worker_for(&mount).await {
             let _ = self.state.delete_mount(mount_id);
-            let _ = self.state.delete_credentials(&credentials_id);
+            if owns_credentials {
+                let _ = self.state.delete_credentials(&credentials_id);
+            }
             let _ = self.svc.forget_subvolume(sv.id);
             let _ = townos.remove_filesystem(&townos_name).await;
             return Err(e);

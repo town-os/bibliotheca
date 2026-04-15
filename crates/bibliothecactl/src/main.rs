@@ -3,6 +3,8 @@
 
 use std::path::PathBuf;
 
+use bibliotheca_config::BibliothecaConfig;
+use bibliotheca_oauth::{run_flow, BrokerParams};
 use bibliotheca_proto::v1::anisette_admin_client::AnisetteAdminClient;
 use bibliotheca_proto::v1::identity_client::IdentityClient;
 use bibliotheca_proto::v1::storage_client::StorageClient;
@@ -28,6 +30,13 @@ struct Args {
         default_value = "/run/bibliotheca/control.sock"
     )]
     socket: PathBuf,
+
+    /// Path to a bibliotheca config file. Used by subcommands that
+    /// need to know about OAuth provider profiles, share defaults,
+    /// etc. Falls back to `/etc/bibliotheca/bibliotheca.yml` if the
+    /// default exists, otherwise to built-in defaults.
+    #[arg(long, env = "BIBLIOTHECA_CONFIG")]
+    config: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Cmd,
@@ -152,12 +161,21 @@ enum SyncCmd {
         #[command(subcommand)]
         cmd: SyncSecretCmd,
     },
+    /// Three-legged OAuth broker: runs the authorize + code exchange
+    /// flow locally and uploads the resulting refresh token to the
+    /// daemon. Operators do this once per provider account before
+    /// creating a mount.
+    Oauth {
+        #[command(subcommand)]
+        cmd: SyncOauthCmd,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum SyncMountCmd {
     /// Create a new mount. Credentials are read from a file (JSON)
-    /// to keep them out of the process command line.
+    /// to keep them out of the process command line, or reused from
+    /// a previous `sync oauth run` that returned a credentials id.
     Create {
         #[arg(long)]
         name: String,
@@ -174,8 +192,14 @@ enum SyncMountCmd {
         /// Path to a JSON file describing the credentials to use.
         /// Shape matches the CredentialBlob enum — e.g.
         /// `{"kind":"basic","username":"alice","password":"hunter2"}`.
+        /// Mutually exclusive with `--existing-credentials-id`.
+        #[arg(long, conflicts_with = "existing_credentials_id")]
+        credentials_file: Option<PathBuf>,
+        /// Reuse an existing encrypted credentials row — e.g. one
+        /// returned by `bibliothecactl sync oauth run`. Mutually
+        /// exclusive with `--credentials-file`.
         #[arg(long)]
-        credentials_file: PathBuf,
+        existing_credentials_id: Option<String>,
         /// Repeatable `--config key=val`.
         #[arg(long = "config", value_parser = parse_kv)]
         config: Vec<(String, String)>,
@@ -225,6 +249,25 @@ enum SyncSecretCmd {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum SyncOauthCmd {
+    /// Run the three-legged OAuth flow for the named provider
+    /// (e.g. `dropbox`, `gphotos`) and upload the resulting refresh
+    /// token to the daemon. Prints the new credentials id on
+    /// success — pass it to `sync mount create
+    /// --existing-credentials-id <id>`.
+    Run {
+        /// Provider profile name as it appears in the
+        /// `oauth.providers` map of the bibliotheca config file.
+        #[arg(long)]
+        provider: String,
+        /// Additional scopes to request on top of whatever the
+        /// provider profile already declares. Repeatable.
+        #[arg(long = "scope")]
+        scopes: Vec<String>,
+    },
+}
+
 fn parse_kv(s: &str) -> Result<(String, String), String> {
     s.split_once('=')
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -242,6 +285,7 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
     let socket = args.socket.clone();
+    let config_path = args.config.clone();
 
     // tonic requires a URI even for unix sockets — the actual connect
     // happens via the connector below.
@@ -407,6 +451,9 @@ async fn main() -> anyhow::Result<()> {
                             .await?;
                     }
                 },
+                SyncCmd::Oauth { cmd } => {
+                    run_sync_oauth_cmd(&mut client, config_path.as_deref(), cmd).await?
+                }
             }
         }
         Cmd::Subvolume { cmd } => {
@@ -489,6 +536,7 @@ async fn run_sync_mount_cmd(
             quota_bytes,
             interval_secs,
             credentials_file,
+            existing_credentials_id,
             config,
         } => {
             let kind_pb = match kind.as_str() {
@@ -506,9 +554,20 @@ async fn run_sync_mount_cmd(
                 "both" => pb::SyncDirection::Both,
                 other => anyhow::bail!("unknown direction: {other}"),
             };
-            let raw = std::fs::read(&credentials_file)?;
-            let blob: serde_json::Value = serde_json::from_slice(&raw)?;
-            let credentials = creds_from_json(&blob)?;
+            let (credentials, existing_id) = match (credentials_file, existing_credentials_id) {
+                (Some(path), None) => {
+                    let raw = std::fs::read(&path)?;
+                    let blob: serde_json::Value = serde_json::from_slice(&raw)?;
+                    (Some(creds_from_json(&blob)?), String::new())
+                }
+                (None, Some(id)) => (None, id),
+                (Some(_), Some(_)) => anyhow::bail!(
+                    "pass exactly one of --credentials-file or --existing-credentials-id"
+                ),
+                (None, None) => {
+                    anyhow::bail!("pass one of --credentials-file or --existing-credentials-id")
+                }
+            };
             let config_map: std::collections::HashMap<String, String> =
                 config.into_iter().collect();
             let req = pb::CreateMountRequest {
@@ -519,7 +578,8 @@ async fn run_sync_mount_cmd(
                 interval_secs,
                 owner_user_id: owner,
                 config: config_map,
-                credentials: Some(credentials),
+                existing_credentials_id: existing_id,
+                credentials,
             };
             let resp = client.create_mount(req).await?;
             print_mount(&resp.into_inner());
@@ -558,6 +618,45 @@ async fn run_sync_mount_cmd(
         }
         SyncMountCmd::Delete { id } => {
             client.delete_mount(pb::DeleteMountRequest { id }).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn run_sync_oauth_cmd(
+    client: &mut SyncAdminClient<tonic::transport::Channel>,
+    config_path: Option<&std::path::Path>,
+    cmd: SyncOauthCmd,
+) -> anyhow::Result<()> {
+    match cmd {
+        SyncOauthCmd::Run { provider, scopes } => {
+            let cfg = BibliothecaConfig::load_or_default(config_path)?;
+            let outcome = run_flow(
+                BrokerParams {
+                    oauth: &cfg.oauth,
+                    provider: &provider,
+                    extra_scopes: scopes,
+                },
+                |url| {
+                    println!("open this URL in a browser to approve the flow:");
+                    println!("{url}");
+                },
+            )
+            .await?;
+            let req = pb::StoreOAuthCredentialsRequest {
+                credentials: Some(pb::OAuth2Credentials {
+                    access_token: outcome.access_token,
+                    refresh_token: outcome.refresh_token,
+                    expires_at: outcome.expires_at,
+                    client_id: outcome.client_id,
+                    client_secret: outcome.client_secret,
+                    token_url: outcome.token_url,
+                }),
+            };
+            let resp = client.store_o_auth_credentials(req).await?;
+            let id = resp.into_inner().credentials_id;
+            println!("credentials id:\t{id}");
+            println!("pass `--existing-credentials-id {id}` to `sync mount create` to bind it.");
         }
     }
     Ok(())

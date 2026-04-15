@@ -23,6 +23,7 @@ members = [
     "crates/bibliotheca-sync-icloud",
     "crates/bibliotheca-anisette",
     "crates/bibliotheca-config",
+    "crates/bibliotheca-oauth",
     "crates/bibliothecad",
     "crates/bibliothecactl",
 ]
@@ -57,6 +58,7 @@ bibliotheca-sync-gphotos = { path = "crates/bibliotheca-sync-gphotos" }
 bibliotheca-sync-icloud = { path = "crates/bibliotheca-sync-icloud" }
 bibliotheca-anisette = { path = "crates/bibliotheca-anisette" }
 bibliotheca-config = { path = "crates/bibliotheca-config" }
+bibliotheca-oauth = { path = "crates/bibliotheca-oauth" }
 
 anyhow = "1"
 thiserror = "1"

@@ -11,6 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 bibliotheca-proto.workspace = true
+bibliotheca-config.workspace = true
+bibliotheca-oauth.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true

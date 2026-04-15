@@ -320,6 +320,19 @@ message CreateMountRequest {
     ICloudCredentials icloud = 13;
     IpfsCredentials ipfs = 14;
   }
+  // Alternative to `credentials`: reuse an existing encrypted
+  // credentials row (e.g. one created via
+  // `StoreOAuthCredentials`). Exactly one of `credentials` /
+  // `existing_credentials_id` must be set.
+  string existing_credentials_id = 15;
+}
+
+message StoreOAuthCredentialsRequest {
+  OAuth2Credentials credentials = 1;
+}
+
+message StoreOAuthCredentialsResponse {
+  string credentials_id = 1;
 }
 
 message UpdateMountRequest {
@@ -398,4 +411,5 @@ service SyncAdmin {
   rpc SubmitTwoFactorCode(SubmitTwoFactorCodeRequest) returns (google.protobuf.Empty);
   rpc TailEvents(TailEventsRequest) returns (stream SyncEvent);
   rpc RotateSecretKey(RotateSecretKeyRequest) returns (google.protobuf.Empty);
+  rpc StoreOAuthCredentials(StoreOAuthCredentialsRequest) returns (StoreOAuthCredentialsResponse);
 }
