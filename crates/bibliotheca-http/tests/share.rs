@@ -14,7 +14,6 @@ use bibliotheca_core::data::DataStore;
 use bibliotheca_core::service::BibliothecaService;
 use bibliotheca_core::share::CreateShareParams;
 use bibliotheca_core::store::Store;
-use bibliotheca_core::testing::MemoryBackend;
 use bibliotheca_http::{start, HttpConfig};
 use tempfile::TempDir;
 use time::OffsetDateTime;
@@ -27,8 +26,8 @@ struct Harness {
 
 async fn spawn(share_enabled: bool) -> Harness {
     let tmp = TempDir::new().unwrap();
-    let backend = Arc::new(MemoryBackend::new(tmp.path().join("sv")));
-    let dyn_backend: Arc<dyn SubvolumeBackend> = backend;
+    let dyn_backend: Arc<dyn SubvolumeBackend> =
+        bibliotheca_btrfs::testing::test_backend(tmp.path().join("sv"));
     let store = Store::open_in_memory().unwrap();
     let svc = BibliothecaService::new(store, dyn_backend);
 

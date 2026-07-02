@@ -1,9 +1,10 @@
 //! End-to-end tests for the Google Photos Library API surface.
 //!
 //! Spawns the interface on an ephemeral TCP port, seeds a library
-//! subvolume with `MemoryBackend`, then drives the upload →
-//! batchCreate → list → search → download flow via `reqwest` plus
-//! covers the auth / permission edges.
+//! subvolume via `bibliotheca_btrfs::testing::test_backend` (in-memory
+//! fake by default, real btrfs under `make test-container`), then drives
+//! the upload → batchCreate → list → search → download flow via `reqwest`
+//! plus covers the auth / permission edges.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -13,7 +14,6 @@ use base64::Engine as _;
 use bibliotheca_core::backend::SubvolumeBackend;
 use bibliotheca_core::service::BibliothecaService;
 use bibliotheca_core::store::Store;
-use bibliotheca_core::testing::MemoryBackend;
 use bibliotheca_photos::{start, PhotosConfig};
 use tempfile::TempDir;
 
@@ -25,8 +25,8 @@ struct Harness {
 
 async fn spawn() -> Harness {
     let tmp = TempDir::new().unwrap();
-    let backend = Arc::new(MemoryBackend::new(tmp.path().join("sv")));
-    let dyn_backend: Arc<dyn SubvolumeBackend> = backend;
+    let dyn_backend: Arc<dyn SubvolumeBackend> =
+        bibliotheca_btrfs::testing::test_backend(tmp.path().join("sv"));
     let store = Store::open_in_memory().unwrap();
     let svc = BibliothecaService::new(store, dyn_backend);
 

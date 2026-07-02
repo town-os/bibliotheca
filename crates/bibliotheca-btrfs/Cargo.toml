@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Exposes `bibliotheca_btrfs::testing::test_backend`, letting the workspace's
+# integration harnesses run against either the in-memory fake or a real btrfs
+# filesystem. Pulls in bibliotheca-core's MemoryBackend.
+test-support = ["bibliotheca-core/test-support"]
+
 [dependencies]
 bibliotheca-core.workspace = true
 async-trait.workspace = true

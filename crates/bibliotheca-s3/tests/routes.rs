@@ -1,10 +1,12 @@
 //! End-to-end tests for the S3 interface.
 //!
 //! Each test spawns the interface on an ephemeral port and drives it
-//! with a real HTTP client. The service is backed by the in-process
-//! `MemoryBackend` so we can create subvolumes with `BibliothecaService`
-//! directly, then talk to them with bucket-shaped S3 requests over
-//! TCP.
+//! with a real HTTP client. The service is backed by whatever
+//! `bibliotheca_btrfs::testing::test_backend` selects — the in-memory
+//! fake by default, or a real btrfs subvolume backend under
+//! `make test-container` — so we can create subvolumes with
+//! `BibliothecaService` directly, then talk to them with bucket-shaped
+//! S3 requests over TCP.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -13,7 +15,6 @@ use std::time::Duration;
 use bibliotheca_core::backend::SubvolumeBackend;
 use bibliotheca_core::service::BibliothecaService;
 use bibliotheca_core::store::Store;
-use bibliotheca_core::testing::MemoryBackend;
 use bibliotheca_s3::{start, S3Config};
 use tempfile::TempDir;
 
@@ -25,8 +26,8 @@ struct Harness {
 
 async fn spawn() -> Harness {
     let tmp = TempDir::new().unwrap();
-    let backend = Arc::new(MemoryBackend::new(tmp.path().join("sv")));
-    let dyn_backend: Arc<dyn SubvolumeBackend> = backend;
+    let dyn_backend: Arc<dyn SubvolumeBackend> =
+        bibliotheca_btrfs::testing::test_backend(tmp.path().join("sv"));
     let store = Store::open_in_memory().unwrap();
     let svc = BibliothecaService::new(store, dyn_backend);
 

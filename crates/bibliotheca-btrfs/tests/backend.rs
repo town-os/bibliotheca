@@ -249,16 +249,49 @@ async fn real_btrfs_round_trip() {
     let name = format!("bibliotheca-test-{}", std::process::id());
     let path = backend.path_for(&name);
 
+    // 1. Real subvolume creation.
     backend
         .create_subvolume(&path)
         .await
         .expect("create_subvolume");
-    assert!(path.exists());
+    assert!(path.exists(), "subvolume dir should exist after create");
 
-    // Best-effort cleanup.
+    // 2. Bytes written into the subvolume read back intact — the same
+    //    std::fs path DataStore::put/get uses, now on a real btrfs subvolume.
+    let file = path.join("greeting.txt");
+    std::fs::write(&file, b"hello from real btrfs").expect("write into subvolume");
+    assert_eq!(
+        std::fs::read(&file).expect("read back"),
+        b"hello from real btrfs"
+    );
+
+    // 3. Quota set + clear via `btrfs qgroup limit`. Requires the mount to
+    //    have had `btrfs quota enable` run (the container harness does this).
+    backend
+        .set_quota(&path, 64 * 1024 * 1024)
+        .await
+        .expect("set_quota");
+    backend.set_quota(&path, 0).await.expect("clear_quota");
+
+    // 4. A read-only snapshot is an independent subvolume with the same bytes.
+    let snap = backend.root().join(".snapshots").join(&name).join("snap1");
+    backend
+        .snapshot(&path, &snap, true)
+        .await
+        .expect("snapshot");
+    assert_eq!(
+        std::fs::read(snap.join("greeting.txt")).expect("read from snapshot"),
+        b"hello from real btrfs"
+    );
+
+    // Best-effort cleanup: snapshot first, then the source subvolume.
+    backend
+        .delete_subvolume(&snap)
+        .await
+        .expect("delete snapshot");
     backend
         .delete_subvolume(&path)
         .await
         .expect("delete_subvolume");
-    assert!(!path.exists());
+    assert!(!path.exists(), "subvolume dir should be gone after delete");
 }

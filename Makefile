@@ -76,6 +76,10 @@ test-doc: ## Run doc tests
 test-real-btrfs: ## Run ignored real-btrfs tests (set BIBLIOTHECA_REAL_BTRFS_ROOT=...)
 	$(CARGO) test -p bibliotheca-btrfs --test backend -- --ignored
 
+.PHONY: test-container
+test-container: ## Run the whole suite against a real loopback btrfs in a container
+	./ci/container-tests.sh
+
 # ---- composites ----
 
 .PHONY: ci

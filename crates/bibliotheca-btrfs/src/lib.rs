@@ -17,6 +17,9 @@ use tokio::process::Command;
 use tokio::time::timeout;
 use tracing::{debug, instrument};
 
+#[cfg(feature = "test-support")]
+pub mod testing;
+
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]

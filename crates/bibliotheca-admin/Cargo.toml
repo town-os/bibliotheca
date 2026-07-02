@@ -21,5 +21,6 @@ time.workspace = true
 
 [dev-dependencies]
 bibliotheca-core = { workspace = true, features = ["test-support"] }
+bibliotheca-btrfs = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true
 reqwest = { workspace = true, features = ["json"] }
