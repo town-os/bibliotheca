@@ -82,6 +82,7 @@ tonic = "0.12"
 tonic-build = "0.12"
 prost = "0.13"
 prost-types = "0.13"
+protoc-bin-vendored = "3"
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio", "server"] }
 http = "1"
